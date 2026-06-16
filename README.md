@@ -1,61 +1,52 @@
 # Knowledge MCP Server
 
-> 轻量级 Agent 知识存储 MCP 工具 — 带可信度标注、推理链追溯、级联降级、冲突检测。
->
-> *Lightweight agent knowledge store — confidence labeling, reasoning chains, cascade invalidation, conflict detection.*
+> Lightweight agent knowledge store — confidence labeling, reasoning chains, cascade invalidation, conflict detection.
+
+[中文文档 / Chinese docs](README_CN.md)
 
 ---
 
-## 设计理念 / Design Philosophy
+## Design Philosophy
 
-**不是记忆系统、不是知识图谱、不是向量搜索。** 就是一个带可信度标签的事实存储。
+Not a memory system, not a knowledge graph, not vector search. Just fact storage with confidence labels.
 
-Agent 每完成一步推理，记录一条知识。核心价值：
-- **区分事实与推断**：confirmed（已验证）vs likely（推导）vs speculative（猜测）
-- **推理链可追溯**：推翻一条，所有下游推断自动失效
-- **证据不丢失**：推翻结论后原始证据仍可召回
-
-> *Not a memory system, not a knowledge graph, not vector search. Just fact storage with confidence labels.*
->
-> *The agent records one piece of knowledge per reasoning step. Core values:*
-> - *Separate facts from inferences*
-> - *Traceable reasoning chains — invalidate one node, all downstream auto-expire*
-> - *Evidence never lost — original tool output survives conclusion overturns*
+The agent records one piece of knowledge per reasoning step. Core values:
+- **Separate facts from inferences**: confirmed (verified) vs likely (deduced) vs speculative (guess)
+- **Traceable reasoning chains**: invalidate one node, all downstream auto-expire
+- **Evidence never lost**: original tool output survives conclusion overturns
 
 ---
 
-## 四级置信度 / Four Confidence Levels
+## Four Confidence Levels
 
-| 级别 Level | 含义 Meaning | 判定规则 / Criteria |
-|------------|-------------|---------------------|
-| `confirmed` | 已验证为真 / Verified true | 工具实际输出、用户明确陈述、代码/配置字面值 |
-| `disproved` | 已验证为假 / Verified false | 尝试后明确失败、新证据推翻旧结论 |
-| `likely` | 未验证但合理推导 / Plausible | 多线索推断、常见默认行为、行业惯例 |
-| `speculative` | 纯猜测 / Pure guess | 无证据支撑、"可能""也许"的假设 |
+| Level | Meaning | Criteria |
+|-------|---------|----------|
+| `confirmed` | Verified true | Tool output, user statement, literal config/code value |
+| `disproved` | Verified false | Tried and failed, new evidence overturns old conclusion |
+| `likely` | Plausible (unverified) | Multi-clue inference, common defaults, conventions |
+| `speculative` | Pure guess | No evidence, "maybe"/"perhaps" assumptions |
 
 ---
 
-## MCP 工具 / Tools
+## MCP Tools
 
-### knowledge_store — 存储知识 / Store
+### knowledge_store — Store knowledge
 
 ```json
 {
   "project": "HITCON2024_rev1",
-  "fact": "sub_4012a0 使用 256 字节 S-box，是 RC4 KSA",
+  "fact": "sub_4012a0 uses 256-byte S-box with swap loop, likely RC4 KSA",
   "confidence": "confirmed",
   "source": "tool:ida:sub_4012a0",
-  "evidence": "mov edx,[rbp+sbox]; inc eax; mov cl,[rdx+rax]; 循环 256 次",
+  "evidence": "mov edx,[rbp+sbox]; inc eax; mov cl,[rdx+rax]; loops 256 times",
   "based_on": "<parent-knowledge-id>",
   "tags": ["binary:challenge.exe", "crypto", "rc4"]
 }
 ```
 
-存入 `confirmed`/`disproved` 时自动检测与已有条目冲突，返回 `_conflicts` 列表。
+When storing `confirmed`/`disproved`, auto-detects conflicts with existing entries. Returns `_conflicts` list when found.
 
-> *Auto-detects conflicts with existing confirmed/disproved entries on store.*
-
-### knowledge_search — 搜索 / Search
+### knowledge_search — Search
 
 ```json
 {
@@ -67,46 +58,40 @@ Agent 每完成一步推理，记录一条知识。核心价值：
 }
 ```
 
-搜索规则：`query` 对 fact/evidence 做文本匹配，`confidence: "verified"` 快捷匹配 confirmed + disproved，多条件 AND 逻辑。
+Text-match on `fact`/`evidence`. `confidence: "verified"` matches both confirmed + disproved. Multi-condition AND logic.
 
-> *Text-match search on fact/evidence. `confidence: "verified"` matches both confirmed + disproved. Multi-condition AND.*
+### knowledge_get — Get single entry
 
-### knowledge_get — 获取单条 / Get Single Entry
+Returns full entry + `dependent_count` (how many entries depend on it).
 
-返回完整记录 + `dependent_count`（有多少条目依赖它）。
+### knowledge_update — Update (with cascade)
 
-> *Returns full entry + dependent_count.*
-
-### knowledge_update — 更新 / Update
-
-将条目标为 `disproved` 时自动级联降级：
-- 所有 `based_on` 指向此 ID 的条目 → 降级为 `speculative` + 追加 `invalidated` 标签
-- 递归处理二级依赖
-
-> *Cascade invalidation: marking an entry as disproved → all dependents → speculative + [invalidated] tag. Recursive.*
+Marking an entry as `disproved` triggers cascade invalidation:
+- All entries with `based_on` pointing to this ID → downgraded to `speculative` + `invalidated` tag
+- Recursive (second-level dependents also invalidated)
 
 ---
 
-## 部署 / Deployment
+## Deployment
 
-### 方式一：直接运行 / Direct
+### Direct
 
 ```bash
 pip install mcp
 python server.py
 ```
 
-### 方式二：Docker
+### Docker
 
 ```bash
 docker build -t knowledge-mcp .
 docker run -i --rm -v ~/.hermes/knowledge:/data knowledge-mcp
 ```
 
-### Hermes Agent 配置 / Hermes Config
+### Hermes Agent Config
 
 ```yaml
-# 直接运行 / Direct
+# Direct
 mcp_servers:
   knowledge:
     command: python
@@ -125,37 +110,36 @@ mcp_servers:
 
 ---
 
-## 存储结构 / Storage
+## Storage
 
 ```
-~/.hermes/knowledge/             # 可通过 KNOWLEDGE_DB_DIR 环境变量修改
-├── HITCON2024_rev1.db           # 每个项目独立 SQLite 文件
-├── pbb_new.db                   # One SQLite file per project
+~/.hermes/knowledge/             # Override with KNOWLEDGE_DB_DIR env
+├── HITCON2024_rev1.db           # One SQLite file per project
+├── pbb_new.db
 └── some-project.db
 ```
 
 ---
 
-## System Prompt 建议 / Suggested Prompt
+## Suggested System Prompt
 
 ```
-## 知识记录规则 / Knowledge Recording Rules
+## Knowledge Recording Rules
 
-每次推理步骤后有可复用的发现时，调用 knowledge_store。
 Call knowledge_store after each reasoning step with reusable findings.
 
-打分规则 / Confidence rules:
-- confirmed: 工具实际返回、用户原话、文件/配置中读到的字面值
-- disproved: 已验证为假、被新证据推翻的旧结论
-- likely: 从已知信息推导但未直接验证
-- speculative: 无证据的猜测
+Confidence rules:
+- confirmed: tool output, user statement, literal config/code values
+- disproved: verified false, overtaken by new evidence
+- likely: deduced from known info but not directly verified
+- speculative: no evidence
 
-重要结论前，先调用 knowledge_search 检查是否有 confirmed 直接答案或 disproved 冲突。
-Before any important conclusion, search for confirmed answers or disproved contradictions.
+Before any important conclusion, search for confirmed answers or disproved contradictions
+using knowledge_search.
 ```
 
 ---
 
-## 许可证 / License
+## License
 
 MIT
