@@ -1,5 +1,7 @@
 # Knowledge MCP Server
 
+[![Docker Pulls](https://img.shields.io/docker/pulls/gfishx/knowledge-mcp)](https://hub.docker.com/r/gfishx/knowledge-mcp)
+
 > 轻量级 Agent 知识存储 MCP 工具 — 带可信度标注、推理链追溯、级联降级、冲突检测。
 
 [English docs / 英文文档](README.md)
@@ -84,6 +86,10 @@ python server.py
 ### Docker
 
 ```bash
+# 预构建镜像（推荐）
+docker run -i --rm -v ~/.hermes/knowledge:/data gfishx/knowledge-mcp
+
+# 从源码构建
 docker build -t knowledge-mcp .
 docker run -i --rm -v ~/.hermes/knowledge:/data knowledge-mcp
 ```
@@ -101,11 +107,11 @@ mcp_servers:
 ```
 
 ```yaml
-# Docker
+# Docker（预构建镜像）
 mcp_servers:
   knowledge:
     command: docker
-    args: ["run", "-i", "--rm", "-v", "/home/agent/.hermes/knowledge:/data", "knowledge-mcp"]
+    args: ["run", "-i", "--rm", "-v", "/home/agent/.hermes/knowledge:/data", "gfishx/knowledge-mcp"]
 ```
 
 ---

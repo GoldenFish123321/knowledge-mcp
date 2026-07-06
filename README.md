@@ -1,5 +1,7 @@
 # Knowledge MCP Server
 
+[![Docker Pulls](https://img.shields.io/docker/pulls/gfishx/knowledge-mcp)](https://hub.docker.com/r/gfishx/knowledge-mcp)
+
 > Lightweight agent knowledge store — confidence labeling, reasoning chains, cascade invalidation, conflict detection.
 
 [中文文档 / Chinese docs](README_CN.md)
@@ -84,6 +86,10 @@ python server.py
 ### Docker
 
 ```bash
+# Pre-built image (recommended)
+docker run -i --rm -v ~/.hermes/knowledge:/data gfishx/knowledge-mcp
+
+# Build from source
 docker build -t knowledge-mcp .
 docker run -i --rm -v ~/.hermes/knowledge:/data knowledge-mcp
 ```
@@ -101,11 +107,11 @@ mcp_servers:
 ```
 
 ```yaml
-# Docker
+# Docker (pre-built)
 mcp_servers:
   knowledge:
     command: docker
-    args: ["run", "-i", "--rm", "-v", "/home/agent/.hermes/knowledge:/data", "knowledge-mcp"]
+    args: ["run", "-i", "--rm", "-v", "/home/agent/.hermes/knowledge:/data", "gfishx/knowledge-mcp"]
 ```
 
 ---
