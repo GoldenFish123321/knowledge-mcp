@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Knowledge MCP Server — 轻量级 Agent 知识存储，带可信度标注与推理链
+Findings MCP Server — 轻量级 Agent 推理发现存储，带可信度标注与推理链
 
 四级置信度:
   confirmed   — 已验证为真（工具输出/用户原话/文件内容）
@@ -9,10 +9,10 @@ Knowledge MCP Server — 轻量级 Agent 知识存储，带可信度标注与推
   speculative — 纯猜测
 
 工具:
-  knowledge_store  — 存储一条知识
-  knowledge_search — 搜索知识
-  knowledge_get    — 获取单条
-  knowledge_update — 更新（含级联降级 + 冲突检测）
+  findings_store  — 存储一条发现
+  findings_search — 搜索发现
+  findings_get    — 获取单条
+  findings_update — 更新（含级联降级 + 冲突检测）
 """
 
 import os
@@ -29,7 +29,7 @@ from mcp.types import Tool, TextContent
 from mcp.server.stdio import stdio_server
 
 # ─── 配置 ──────────────────────────────────────────────────────────
-DB_DIR = Path(os.environ.get("KNOWLEDGE_DB_DIR", os.path.expanduser("~/.hermes/knowledge")))
+DB_DIR = Path(os.environ.get("FINDINGS_DB_DIR", os.path.expanduser("~/.hermes/findings")))
 DB_DIR.mkdir(parents=True, exist_ok=True)
 
 VALID_CONFIDENCE = {"confirmed", "disproved", "likely", "speculative"}
@@ -144,10 +144,10 @@ def _check_conflicts(conn: sqlite3.Connection, project: str, fact: str, exclude_
     return [_row_to_dict(r) for r in rows]
 
 
-def store_knowledge(project: str, fact: str, confidence: str, source: str,
-                    evidence: str = "", based_on: str | None = None,
-                    tags: list[str] | None = None) -> dict:
-    """存储一条知识。"""
+def store_finding(project: str, fact: str, confidence: str, source: str,
+                  evidence: str = "", based_on: str | None = None,
+                  tags: list[str] | None = None) -> dict:
+    """存储一条发现。"""
     if confidence not in VALID_CONFIDENCE:
         raise ValueError(f"Invalid confidence: {confidence}. Must be one of {VALID_CONFIDENCE}")
     if len(fact) > MAX_FACT_LENGTH:
@@ -184,9 +184,9 @@ def store_knowledge(project: str, fact: str, confidence: str, source: str,
     return result
 
 
-def search_knowledge(project: str, query: str = "", confidence: str | None = None,
-                     tag: str | None = None, limit: int = 20) -> list[dict]:
-    """搜索知识。"""
+def search_findings(project: str, query: str = "", confidence: str | None = None,
+                    tag: str | None = None, limit: int = 20) -> list[dict]:
+    """搜索发现。"""
     conn = _get_conn(project)
     
     conditions = ["project = ?"]
@@ -216,8 +216,8 @@ def search_knowledge(project: str, query: str = "", confidence: str | None = Non
     return results
 
 
-def get_knowledge(project: str, kid: str) -> dict | None:
-    """获取单条知识，包含依赖计数。"""
+def get_finding(project: str, kid: str) -> dict | None:
+    """获取单条发现，包含依赖计数。"""
     conn = _get_conn(project)
     row = conn.execute("SELECT * FROM knowledge WHERE id = ?", (kid,)).fetchone()
     if not row:
@@ -236,16 +236,16 @@ def get_knowledge(project: str, kid: str) -> dict | None:
     return result
 
 
-def update_knowledge(project: str, kid: str, fact: str | None = None,
-                     confidence: str | None = None, evidence: str | None = None,
-                     tags: list[str] | None = None) -> dict:
-    """更新知识条目。标 disproved 时触发级联降级。"""
+def update_finding(project: str, kid: str, fact: str | None = None,
+                   confidence: str | None = None, evidence: str | None = None,
+                   tags: list[str] | None = None) -> dict:
+    """更新发现条目。标 disproved 时触发级联降级。"""
     conn = _get_conn(project)
     
     existing = conn.execute("SELECT * FROM knowledge WHERE id = ?", (kid,)).fetchone()
     if not existing:
         conn.close()
-        raise ValueError(f"Knowledge not found: {kid}")
+        raise ValueError(f"Finding not found: {kid}")
     
     updates = []
     params = []
@@ -306,15 +306,15 @@ def update_knowledge(project: str, kid: str, fact: str | None = None,
 
 # ─── MCP Server ────────────────────────────────────────────────────
 
-server = Server("knowledge-mcp")
+server = Server("findings-mcp")
 
 
 @server.list_tools()
 async def list_tools() -> list[Tool]:
     return [
         Tool(
-            name="knowledge_store",
-            description="""存储一条带可信度标注的知识。
+            name="findings_store",
+            description="""存储一条带可信度标注的推理发现。
 
 置信度级别:
   confirmed   — 已验证为真（工具实测输出、用户明确陈述、文件直接内容）
@@ -322,7 +322,7 @@ async def list_tools() -> list[Tool]:
   likely      — 未验证但基于多线索的合理推导
   speculative — 无证据支撑的猜测
 
-存储成功后自动检测与已有 confirmed/disproved 知识的潜在冲突。
+存储成功后自动检测与已有 confirmed/disproved 发现的潜在冲突。
 
 参数:
   project     — 项目名（如 'HITCON2024_rev1'），自动创建独立数据库
@@ -330,7 +330,7 @@ async def list_tools() -> list[Tool]:
   confidence  — 置信度：confirmed|disproved|likely|speculative
   source      — 来源描述（如 'tool:nmap:10.0.0.1'、'inference:deduced'、'user:stated'）
   evidence    — 证据摘要（工具输出/反汇编片段/用户原话）
-  based_on    — 推理来源的 knowledge ID，用于追溯推理链
+  based_on    — 推理来源的 finding ID，用于追溯推理链
   tags        — 标签列表（如 ['binary:challenge.exe','crypto','rc4']）""",
             inputSchema={
                 "type": "object",
@@ -340,15 +340,15 @@ async def list_tools() -> list[Tool]:
                     "confidence": {"type": "string", "enum": list(VALID_CONFIDENCE)},
                     "source": {"type": "string", "description": "来源描述"},
                     "evidence": {"type": "string", "default": "", "description": "证据摘要"},
-                    "based_on": {"type": "string", "description": "推理来源 knowledge ID"},
+                    "based_on": {"type": "string", "description": "推理来源 finding ID"},
                     "tags": {"type": "array", "items": {"type": "string"}, "description": "标签列表"},
                 },
                 "required": ["project", "fact", "confidence", "source"],
             },
         ),
         Tool(
-            name="knowledge_search",
-            description="""搜索知识库。
+            name="findings_search",
+            description="""搜索推理发现。
 
 搜索规则:
   - query 对 fact 和 evidence 字段做文本匹配
@@ -376,12 +376,12 @@ async def list_tools() -> list[Tool]:
             },
         ),
         Tool(
-            name="knowledge_get",
-            description="""获取单条知识的完整信息，包含 dependent_count（有多少条目依赖它）。
+            name="findings_get",
+            description="""获取单条发现的完整信息，包含 dependent_count（有多少条目依赖它）。
 
 参数:
   project — 项目名
-  id      — knowledge ID""",
+  id      — finding ID""",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -392,8 +392,8 @@ async def list_tools() -> list[Tool]:
             },
         ),
         Tool(
-            name="knowledge_update",
-            description="""更新知识条目的置信度、证据或标签。
+            name="findings_update",
+            description="""更新发现条目的置信度、证据或标签。
 
 将条目标记为 disproved 时自动级联：
   - 所有 based_on 指向此条目的推断 → 降级为 speculative
@@ -404,7 +404,7 @@ async def list_tools() -> list[Tool]:
 
 参数:
   project    — 项目名
-  id         — knowledge ID
+  id         — finding ID
   fact       — 新的事实陈述（可选）
   confidence — 新的置信度（可选）
   evidence   — 新的证据（可选）
@@ -428,8 +428,8 @@ async def list_tools() -> list[Tool]:
 @server.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     try:
-        if name == "knowledge_store":
-            result = store_knowledge(
+        if name == "findings_store":
+            result = store_finding(
                 project=arguments["project"],
                 fact=arguments["fact"],
                 confidence=arguments["confidence"],
@@ -440,8 +440,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             )
             return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
         
-        elif name == "knowledge_search":
-            result = search_knowledge(
+        elif name == "findings_search":
+            result = search_findings(
                 project=arguments["project"],
                 query=arguments.get("query", ""),
                 confidence=arguments.get("confidence"),
@@ -450,8 +450,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             )
             return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
         
-        elif name == "knowledge_get":
-            result = get_knowledge(
+        elif name == "findings_get":
+            result = get_finding(
                 project=arguments["project"],
                 kid=arguments["id"],
             )
@@ -459,8 +459,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 return [TextContent(type="text", text=json.dumps({"error": "not found", "id": arguments["id"]}))]
             return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
         
-        elif name == "knowledge_update":
-            result = update_knowledge(
+        elif name == "findings_update":
+            result = update_finding(
                 project=arguments["project"],
                 kid=arguments["id"],
                 fact=arguments.get("fact"),

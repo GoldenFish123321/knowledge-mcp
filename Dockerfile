@@ -7,7 +7,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY server.py .
 
-ENV KNOWLEDGE_DB_DIR=/data
+ENV FINDINGS_DB_DIR=/data
 
 VOLUME ["/data"]
 

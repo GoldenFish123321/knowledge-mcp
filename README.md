@@ -1,8 +1,8 @@
-# Knowledge MCP Server
+# Findings MCP Server
 
-[![Docker Pulls](https://img.shields.io/docker/pulls/gfishx/knowledge-mcp)](https://hub.docker.com/r/gfishx/knowledge-mcp)
+[![Docker Pulls](https://img.shields.io/docker/pulls/gfishx/findings-mcp)](https://hub.docker.com/r/gfishx/findings-mcp)
 
-> Lightweight agent knowledge store — confidence labeling, reasoning chains, cascade invalidation, conflict detection.
+> Lightweight agent reasoning findings store — confidence labeling, reasoning chains, cascade invalidation, conflict detection.
 
 [中文文档 / Chinese docs](README_CN.md)
 
@@ -12,7 +12,7 @@
 
 Not a memory system, not a knowledge graph, not vector search. Just fact storage with confidence labels.
 
-The agent records one piece of knowledge per reasoning step. Core values:
+The agent records one finding per reasoning step. Core values:
 - **Separate facts from inferences**: confirmed (verified) vs likely (deduced) vs speculative (guess)
 - **Traceable reasoning chains**: invalidate one node, all downstream auto-expire
 - **Evidence never lost**: original tool output survives conclusion overturns
@@ -32,7 +32,7 @@ The agent records one piece of knowledge per reasoning step. Core values:
 
 ## MCP Tools
 
-### knowledge_store — Store knowledge
+### findings_store — Store a finding
 
 ```json
 {
@@ -41,14 +41,14 @@ The agent records one piece of knowledge per reasoning step. Core values:
   "confidence": "confirmed",
   "source": "tool:ida:sub_4012a0",
   "evidence": "mov edx,[rbp+sbox]; inc eax; mov cl,[rdx+rax]; loops 256 times",
-  "based_on": "<parent-knowledge-id>",
+  "based_on": "<parent-finding-id>",
   "tags": ["binary:challenge.exe", "crypto", "rc4"]
 }
 ```
 
 When storing `confirmed`/`disproved`, auto-detects conflicts with existing entries. Returns `_conflicts` list when found.
 
-### knowledge_search — Search
+### findings_search — Search
 
 ```json
 {
@@ -62,11 +62,11 @@ When storing `confirmed`/`disproved`, auto-detects conflicts with existing entri
 
 Text-match on `fact`/`evidence`. `confidence: "verified"` matches both confirmed + disproved. Multi-condition AND logic.
 
-### knowledge_get — Get single entry
+### findings_get — Get single entry
 
 Returns full entry + `dependent_count` (how many entries depend on it).
 
-### knowledge_update — Update (with cascade)
+### findings_update — Update (with cascade)
 
 Marking an entry as `disproved` triggers cascade invalidation:
 - All entries with `based_on` pointing to this ID → downgraded to `speculative` + `invalidated` tag
@@ -87,11 +87,11 @@ python server.py
 
 ```bash
 # Pre-built image (recommended)
-docker run -i --rm -v ~/.hermes/knowledge:/data gfishx/knowledge-mcp
+docker run -i --rm -v ~/.hermes/findings:/data gfishx/findings-mcp
 
 # Build from source
-docker build -t knowledge-mcp .
-docker run -i --rm -v ~/.hermes/knowledge:/data knowledge-mcp
+docker build -t findings-mcp .
+docker run -i --rm -v ~/.hermes/findings:/data findings-mcp
 ```
 
 ### Hermes Agent Config
@@ -99,19 +99,19 @@ docker run -i --rm -v ~/.hermes/knowledge:/data knowledge-mcp
 ```yaml
 # Direct
 mcp_servers:
-  knowledge:
+  findings:
     command: python
-    args: ["/path/to/knowledge-mcp/server.py"]
+    args: ["/path/to/findings-mcp/server.py"]
     env:
-      KNOWLEDGE_DB_DIR: /home/agent/.hermes/knowledge
+      FINDINGS_DB_DIR: /home/agent/.hermes/findings
 ```
 
 ```yaml
 # Docker (pre-built)
 mcp_servers:
-  knowledge:
+  findings:
     command: docker
-    args: ["run", "-i", "--rm", "-v", "/home/agent/.hermes/knowledge:/data", "gfishx/knowledge-mcp"]
+    args: ["run", "-i", "--rm", "-v", "/home/agent/.hermes/findings:/data", "gfishx/findings-mcp"]
 ```
 
 ---
@@ -119,8 +119,8 @@ mcp_servers:
 ## Storage
 
 ```
-~/.hermes/knowledge/             # Override with KNOWLEDGE_DB_DIR env
-├── HITCON2024_rev1.db           # One SQLite file per project
+~/.hermes/findings/               # Override with FINDINGS_DB_DIR env
+├── HITCON2024_rev1.db            # One SQLite file per project
 ├── pbb_new.db
 └── some-project.db
 ```
@@ -130,9 +130,9 @@ mcp_servers:
 ## Suggested System Prompt
 
 ```
-## Knowledge Recording Rules
+## Findings Recording Rules
 
-Call knowledge_store after each reasoning step with reusable findings.
+Call findings_store after each reasoning step with reusable findings.
 
 Confidence rules:
 - confirmed: tool output, user statement, literal config/code values
@@ -141,7 +141,7 @@ Confidence rules:
 - speculative: no evidence
 
 Before any important conclusion, search for confirmed answers or disproved contradictions
-using knowledge_search.
+using findings_search.
 ```
 
 ---
