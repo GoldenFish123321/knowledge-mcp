@@ -6,7 +6,7 @@ on:
     tags: ['v*']
 
 env:
-  IMAGE_NAME: ${{ vars.DOCKERHUB_IMAGE || format('{0}/knowledge-mcp', github.repository_owner) }}
+  IMAGE_NAME: ${{ vars.DOCKERHUB_IMAGE || format('{0}/knowledge-mcp', secrets.DOCKERHUB_USERNAME) }}
 
 jobs:
   build-and-push:
