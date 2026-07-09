@@ -3,6 +3,7 @@
 [![Docker Pulls](https://img.shields.io/docker/pulls/gfishx/findings-mcp)](https://hub.docker.com/r/gfishx/findings-mcp)
 
 > 轻量级 Agent 推理发现存储 MCP 工具 — 带可信度标注、推理链追溯、级联降级、冲突检测。
+> 专为 CTF 逆向多 Agent 工作流设计，区分观察与推断，防止幻觉级联。
 
 [English docs / 英文文档](README.md)
 
@@ -13,20 +14,22 @@
 **不是记忆系统、不是知识图谱、不是向量搜索。** 就是一个带可信度标签的事实存储。
 
 Agent 每完成一步推理，记录一条发现。核心价值：
-- **区分事实与推断**：confirmed（已验证）vs likely（推导）vs speculative（猜测）
+- **区分事实与推断**：confirmed-observed（工具原始输出）≠ confirmed-inferred（交叉验证后的推断）
 - **推理链可追溯**：推翻一条，所有下游推断自动失效
 - **证据不丢失**：推翻结论后原始证据仍可召回
+- **角色权责分明**：子 Agent 可标 confirmed-observed / likely，但不可标 confirmed-inferred / speculative
 
 ---
 
-## 四级置信度
+## 五级置信度
 
-| 级别 | 含义 | 判定规则 |
-|------|------|----------|
-| `confirmed` | 已验证为真 | 工具实际输出、用户明确陈述、代码/配置字面值 |
-| `disproved` | 已验证为假 | 尝试后明确失败、新证据推翻旧结论 |
-| `likely` | 未验证但合理推导 | 多线索推断、常见默认行为、行业惯例 |
-| `speculative` | 纯猜测 | 无证据支撑、"可能""也许"的假设 |
+| 级别 | 含义 | 谁可提出 | 谁可确认 | 判定规则 |
+|------|------|---------|---------|----------|
+| `confirmed-observed` | 可复现的原始工具输出 | 子 Agent | 子 Agent | 零推理，直接提交。evidence 须含精确命令 + 原始输出摘录 |
+| `confirmed-inferred` | 交叉验证后的推理结论 | 父 Agent（唯一） | 父 Agent（唯一） | 两个独立子 Agent + 不同工具家族 + 活跃代码路径 + 反对派质疑通过 |
+| `likely` | 子 Agent 的单项推断 | 子 Agent | 父 Agent | 尚未交叉验证；禁止子 Agent 直接标 confirmed-inferred |
+| `speculative` | 父 Agent 的假设/猜测 | 父 Agent（唯一） | 父 Agent（唯一） | 子 Agent 无权提出 |
+| `disproved` | 已证伪 | 任意角色 | 任意识别者 | 发现矛盾即标记；触发级联降级 |
 
 ---
 
@@ -37,30 +40,35 @@ Agent 每完成一步推理，记录一条发现。核心价值：
 ```json
 {
   "project": "HITCON2024_rev1",
-  "fact": "sub_4012a0 使用 256 字节 S-box，是 RC4 KSA",
-  "confidence": "confirmed",
+  "fact": "sub_4012a0 在 0x401310 处读取 qword_40A0，与 0x9E3779B9 异或，符合 TEA 解密特征",
+  "confidence": "confirmed-observed",
   "source": "tool:ida:sub_4012a0",
-  "evidence": "mov edx,[rbp+sbox]; inc eax; mov cl,[rdx+rax]; 循环 256 次",
+  "evidence": "mov rax,[rip+0x40A0]; xor rax,0x9E3779B9; 循环 32 轮",
   "based_on": "<parent-finding-id>",
-  "tags": ["binary:challenge.exe", "crypto", "rc4"]
+  "tags": ["binary:challenge.exe", "crypto", "tea"]
 }
 ```
 
-存入 `confirmed`/`disproved` 时自动检测与已有条目冲突，返回 `_conflicts` 列表。
+存入 `confirmed-observed` / `confirmed-inferred` / `disproved` 时自动检测与已有条目冲突，返回 `_conflicts` 列表。
 
 ### findings_search — 搜索
 
 ```json
 {
   "project": "HITCON2024_rev1",
-  "query": "RC4",
+  "query": "TEA",
   "confidence": "verified",
   "tag": "crypto",
   "limit": 20
 }
 ```
 
-搜索规则：`query` 对 fact/evidence 做文本匹配，`confidence: "verified"` 快捷匹配 confirmed + disproved，多条件 AND。
+搜索规则：`query` 对 fact/evidence 做文本匹配。confidence 快捷方式：
+- `"verified"` → confirmed-observed + confirmed-inferred + disproved（全部已验证条目）
+- `"confirmed"` → confirmed-observed + confirmed-inferred（兼容旧版快捷方式）
+- 具体值如 `"likely"` → 精确匹配该置信度
+
+多条件 AND 逻辑，按创建时间倒序。
 
 ### findings_get — 获取单条
 
@@ -79,7 +87,7 @@ Agent 每完成一步推理，记录一条发现。核心价值：
 ### 直接运行
 
 ```bash
-pip install mcp
+pip install mcp>=1.20.0
 python server.py
 ```
 
@@ -134,14 +142,30 @@ mcp_servers:
 
 每次推理步骤后有可复用的发现时，调用 findings_store。
 
-打分规则：
-- confirmed: 工具实际返回、用户原话、文件/配置中读到的字面值
+置信度规则：
+- confirmed-observed: 工具实际输出、可复现的精确命令+原始摘录，零推理
+- confirmed-inferred: 仅父 Agent 使用，需两个独立子 Agent 交叉验证通过后方可标此级
+- likely: 子 Agent 的单项推断，尚未交叉验证（子 Agent 不得自行标 confirmed-inferred）
+- speculative: 仅父 Agent 使用，假设/猜测
 - disproved: 已验证为假、被新证据推翻的旧结论
-- likely: 从已知信息推导但未直接验证
-- speculative: 无证据的猜测
+
+子 Agent 注意：你只能标 confirmed-observed 或 likely，永远不要标 confirmed-inferred 或 speculative。
+交叉验证和 speculative 假设是父 Agent 的特权。
 
 重要结论前，先调用 findings_search 检查是否有 confirmed 直接答案或 disproved 冲突。
 ```
+
+---
+
+## 从 v1（4 级）迁移
+
+v2 将 `confirmed` 拆分为 `confirmed-observed` 和 `confirmed-inferred`，并新增了角色权限语义。
+已有数据库在首次连接时自动迁移（移除旧 CHECK 约束，应用层校验代替）。
+
+向后兼容：
+- `findings_search` 中 `confidence="confirmed"` 快捷匹配 confirmed-observed + confirmed-inferred
+- `confidence="verified"` 匹配 confirmed-observed + confirmed-inferred + disproved
+- 已有 `confirmed` 数据保留在 DB 中，只是再存入时需用新值
 
 ---
 

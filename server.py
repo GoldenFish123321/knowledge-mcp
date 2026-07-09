@@ -2,11 +2,12 @@
 """
 Findings MCP Server — 轻量级 Agent 推理发现存储，带可信度标注与推理链
 
-四级置信度:
-  confirmed   — 已验证为真（工具输出/用户原话/文件内容）
-  disproved   — 已验证为假（被新证据推翻/尝试后失败）
-  likely      — 未验证但合理推导
-  speculative — 纯猜测
+五级置信度（适配 CTF 逆向多 Agent 工作流）:
+  confirmed-observed — 可复现的原始工具输出，零推理，子 Agent 直接提交
+  confirmed-inferred  — 基于观察推理的结论，需两个独立子 Agent 交叉验证 + 父 Agent 裁决
+  likely              — 子 Agent 的单项推断，尚未交叉验证
+  speculative         — 父 Agent 的假设/猜测，子 Agent 无权提出
+  disproved           — 已证伪（矛盾/新证据推翻），触发级联降级
 
 工具:
   findings_store  — 存储一条发现
@@ -32,22 +33,69 @@ from mcp.server.stdio import stdio_server
 DB_DIR = Path(os.environ.get("FINDINGS_DB_DIR", os.path.expanduser("~/.hermes/findings")))
 DB_DIR.mkdir(parents=True, exist_ok=True)
 
-VALID_CONFIDENCE = {"confirmed", "disproved", "likely", "speculative"}
+VALID_CONFIDENCE = {
+    "confirmed-observed",
+    "confirmed-inferred",
+    "likely",
+    "speculative",
+    "disproved",
+}
 MAX_FACT_LENGTH = 4000
+
+# 需要冲突检测的置信度——所有"已确认/已证伪"的级别
+_CONFLICT_CHECK_CONFIDENCE = {"confirmed-observed", "confirmed-inferred", "disproved"}
 
 # ─── SQLite 数据层 ────────────────────────────────────────────────
 
 def _get_db_path(project: str) -> Path:
     """返回项目数据库文件路径。非法项目名抛出 ValueError。"""
-    # 安全检查：项目名只允许字母数字连字符下划线点
     import re
     if not re.match(r'^[\w\-\.]+$', project):
         raise ValueError(f"Invalid project name: {project}")
     return DB_DIR / f"{project}.db"
 
 
+def _migrate_schema(conn: sqlite3.Connection):
+    """
+    检测并迁移旧版 4 级置信度 schema → 新版 5 级。
+    旧版有 CHECK(confidence IN ('confirmed','disproved','likely','speculative'))，
+    新版移除此 CHECK 约束（完全由应用层 VALID_CONFIDENCE 校验）。
+    """
+    cursor = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='knowledge'"
+    )
+    row = cursor.fetchone()
+    if not row:
+        return
+    schema_sql = row[0]
+    # 检测旧版 CHECK：含单个 'confirmed'（新版是 'confirmed-observed'）
+    if "'confirmed','disproved','likely','speculative'" not in schema_sql:
+        return  # 已是新版或无需迁移
+
+    # 重建表：去掉 CHECK，应用层校验
+    conn.execute("ALTER TABLE knowledge RENAME TO knowledge_old")
+    conn.execute("""
+        CREATE TABLE knowledge (
+            id          TEXT PRIMARY KEY,
+            project     TEXT NOT NULL,
+            fact        TEXT NOT NULL,
+            confidence  TEXT NOT NULL,
+            source      TEXT NOT NULL,
+            evidence    TEXT NOT NULL DEFAULT '',
+            based_on    TEXT,
+            tags        TEXT NOT NULL DEFAULT '[]',
+            created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY (based_on) REFERENCES knowledge(id) ON DELETE SET NULL
+        )
+    """)
+    conn.execute("INSERT INTO knowledge SELECT * FROM knowledge_old")
+    conn.execute("DROP TABLE knowledge_old")
+    conn.commit()
+
+
 def _get_conn(project: str) -> sqlite3.Connection:
-    """获取项目数据库连接，自动建表。"""
+    """获取项目数据库连接，自动建表并迁移旧 schema。"""
     db_path = _get_db_path(project)
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
@@ -58,7 +106,7 @@ def _get_conn(project: str) -> sqlite3.Connection:
             id          TEXT PRIMARY KEY,
             project     TEXT NOT NULL,
             fact        TEXT NOT NULL,
-            confidence  TEXT NOT NULL CHECK(confidence IN ('confirmed','disproved','likely','speculative')),
+            confidence  TEXT NOT NULL,
             source      TEXT NOT NULL,
             evidence    TEXT NOT NULL DEFAULT '',
             based_on    TEXT,
@@ -72,6 +120,9 @@ def _get_conn(project: str) -> sqlite3.Connection:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_project_tags ON knowledge(project, tags)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_based_on ON knowledge(project, based_on)")
     conn.commit()
+
+    # 迁移旧 schema（无操作幂等）
+    _migrate_schema(conn)
     return conn
 
 
@@ -91,6 +142,7 @@ def _cascade_invalidate(conn: sqlite3.Connection, parent_id: str):
     """
     将被推翻条目的所有 based_on 依赖者降级为 speculative + 追加 invalidated 标签。
     递归处理二级依赖链。
+    仅对非 speculative 条目降级（已是 speculative 或 disproved 的跳过）。
     """
     conn.execute("""
         UPDATE knowledge 
@@ -101,12 +153,12 @@ def _cascade_invalidate(conn: sqlite3.Connection, parent_id: str):
                 ELSE tags
             END,
             updated_at = ?
-        WHERE based_on = ? AND confidence != 'speculative'
+        WHERE based_on = ? AND confidence NOT IN ('speculative', 'disproved')
     """, (_now(), parent_id))
     
     # 递归处理被降级条目——它们降级后，依赖它们的也需要降级
     dependents = conn.execute(
-        "SELECT id FROM knowledge WHERE based_on = ? AND confidence != 'speculative'",
+        "SELECT id FROM knowledge WHERE based_on = ? AND confidence NOT IN ('speculative', 'disproved')",
         (parent_id,)
     ).fetchall()
     for dep in dependents:
@@ -115,9 +167,11 @@ def _cascade_invalidate(conn: sqlite3.Connection, parent_id: str):
     conn.commit()
 
 
-def _check_conflicts(conn: sqlite3.Connection, project: str, fact: str, exclude_id: str | None = None) -> list[dict]:
+def _check_conflicts(conn: sqlite3.Connection, project: str, fact: str,
+                     exclude_id: str | None = None) -> list[dict]:
     """
-    简单冲突检测：在 confirmed/disproved 中搜索与 fact 共现关键词的条目。
+    简单冲突检测：在 confirmed-observed / confirmed-inferred / disproved 中
+    搜索与 fact 共现关键词的条目。
     exclude_id: 排除自身 ID（存储后检测时传入）。
     返回冲突条目列表（不含自身）。
     """
@@ -126,7 +180,10 @@ def _check_conflicts(conn: sqlite3.Connection, project: str, fact: str, exclude_
     if not words:
         return []
     
-    conditions = ["project = ?", "confidence IN ('confirmed', 'disproved')"]
+    conditions = [
+        "project = ?",
+        "confidence IN ('confirmed-observed', 'confirmed-inferred', 'disproved')",
+    ]
     params = [project]
     
     word_clauses = " OR ".join(["fact LIKE ?" for _ in words])
@@ -170,8 +227,9 @@ def store_finding(project: str, fact: str, confidence: str, source: str,
     """, (kid, project, fact, confidence, source, evidence, based_on, tags_json, now, now))
     conn.commit()
     
-    # 冲突检测（仅 confirmed/disproved 时检测，排除自身）
-    conflicts = _check_conflicts(conn, project, fact, exclude_id=kid) if confidence in ("confirmed", "disproved") else []
+    # 冲突检测：confirmed-observed / confirmed-inferred / disproved 时检测
+    conflicts = _check_conflicts(conn, project, fact, exclude_id=kid) \
+        if confidence in _CONFLICT_CHECK_CONFIDENCE else []
     
     # 获取完整记录
     row = conn.execute("SELECT * FROM knowledge WHERE id = ?", (kid,)).fetchone()
@@ -197,8 +255,15 @@ def search_findings(project: str, query: str = "", confidence: str | None = None
         params.extend([f"%{query}%", f"%{query}%"])
     if confidence:
         if confidence == "verified":
-            # 快捷方式：verified = confirmed + disproved
-            conditions.append("confidence IN ('confirmed', 'disproved')")
+            # 快捷方式：verified = confirmed-observed + confirmed-inferred + disproved
+            conditions.append(
+                "confidence IN ('confirmed-observed', 'confirmed-inferred', 'disproved')"
+            )
+        elif confidence == "confirmed":
+            # 快捷方式：confirmed = confirmed-observed + confirmed-inferred（兼容旧版）
+            conditions.append(
+                "confidence IN ('confirmed-observed', 'confirmed-inferred')"
+            )
         else:
             conditions.append("confidence = ?")
             params.append(confidence)
@@ -287,7 +352,8 @@ def update_finding(project: str, kid: str, fact: str | None = None,
     # 冲突检测
     new_fact = fact if fact is not None else existing["fact"]
     new_confidence = confidence if confidence is not None else existing["confidence"]
-    conflicts = _check_conflicts(conn, project, new_fact, exclude_id=kid) if new_confidence in ("confirmed", "disproved") else []
+    conflicts = _check_conflicts(conn, project, new_fact, exclude_id=kid) \
+        if new_confidence in _CONFLICT_CHECK_CONFIDENCE else []
     
     # 获取更新后记录
     row = conn.execute("SELECT * FROM knowledge WHERE id = ?", (kid,)).fetchone()
@@ -317,19 +383,20 @@ async def list_tools() -> list[Tool]:
             description="""存储一条带可信度标注的推理发现。
 
 置信度级别:
-  confirmed   — 已验证为真（工具实测输出、用户明确陈述、文件直接内容）
-  disproved   — 已验证为假（尝试后失败、新证据推翻旧结论）
-  likely      — 未验证但基于多线索的合理推导
-  speculative — 无证据支撑的猜测
+  confirmed-observed — 可复现的原始工具输出，零推理，直接提交（子 Agent 可提出/确认）
+  confirmed-inferred  — 基于观察推理的结论，需两个独立子 Agent 交叉验证 + 父 Agent 裁决（仅父 Agent 可提出/确认）
+  likely              — 子 Agent 的单项推断，尚未交叉验证（子 Agent 提出，父 Agent 裁决）
+  speculative         — 父 Agent 的假设/猜测（仅父 Agent 可提出，子 Agent 无权）
+  disproved           — 已证伪，发现矛盾即标记（任意角色可提出/识别）
 
-存储成功后自动检测与已有 confirmed/disproved 发现的潜在冲突。
+存储成功后自动检测与已有 confirmed-observed/confirmed-inferred/disproved 发现的潜在冲突。
 
 参数:
   project     — 项目名（如 'HITCON2024_rev1'），自动创建独立数据库
   fact        — 事实陈述（自然语言，≤4000字符）
-  confidence  — 置信度：confirmed|disproved|likely|speculative
-  source      — 来源描述（如 'tool:nmap:10.0.0.1'、'inference:deduced'、'user:stated'）
-  evidence    — 证据摘要（工具输出/反汇编片段/用户原话）
+  confidence  — 置信度：confirmed-observed|confirmed-inferred|likely|speculative|disproved
+  source      — 来源描述（如 'tool:ida:sub_4012a0'、'inference:cross-validated'、'user:stated'）
+  evidence    — 证据摘要（工具输出/反汇编片段/用户原话，≤500字符推荐）
   based_on    — 推理来源的 finding ID，用于追溯推理链
   tags        — 标签列表（如 ['binary:challenge.exe','crypto','rc4']）""",
             inputSchema={
@@ -337,7 +404,7 @@ async def list_tools() -> list[Tool]:
                 "properties": {
                     "project": {"type": "string", "description": "项目名"},
                     "fact": {"type": "string", "description": "事实陈述"},
-                    "confidence": {"type": "string", "enum": list(VALID_CONFIDENCE)},
+                    "confidence": {"type": "string", "enum": sorted(VALID_CONFIDENCE)},
                     "source": {"type": "string", "description": "来源描述"},
                     "evidence": {"type": "string", "default": "", "description": "证据摘要"},
                     "based_on": {"type": "string", "description": "推理来源 finding ID"},
@@ -352,7 +419,9 @@ async def list_tools() -> list[Tool]:
 
 搜索规则:
   - query 对 fact 和 evidence 字段做文本匹配
-  - confidence 过滤置信度级别（'verified' 快捷匹配 confirmed+disproved）
+  - confidence 过滤置信度级别：
+    'verified' 快捷匹配 confirmed-observed + confirmed-inferred + disproved（所有已验证条目）
+    'confirmed' 快捷匹配 confirmed-observed + confirmed-inferred（兼容旧版）
   - tag 过滤标签
   - 多条件 AND 逻辑
   - 按创建时间倒序
@@ -400,7 +469,7 @@ async def list_tools() -> list[Tool]:
   - 追加 'invalidated' 标签
   - 递归处理二级依赖
 
-更新 confirmed/disproved 条目后自动检测潜在冲突。
+更新 confirmed-observed/confirmed-inferred/disproved 条目后自动检测潜在冲突。
 
 参数:
   project    — 项目名
@@ -415,7 +484,7 @@ async def list_tools() -> list[Tool]:
                     "project": {"type": "string"},
                     "id": {"type": "string"},
                     "fact": {"type": "string"},
-                    "confidence": {"type": "string", "enum": list(VALID_CONFIDENCE)},
+                    "confidence": {"type": "string", "enum": sorted(VALID_CONFIDENCE)},
                     "evidence": {"type": "string"},
                     "tags": {"type": "array", "items": {"type": "string"}},
                 },
