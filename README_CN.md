@@ -3,6 +3,7 @@
 [![Docker Pulls](https://img.shields.io/docker/pulls/gfishx/findings-mcp)](https://hub.docker.com/r/gfishx/findings-mcp)
 
 > 轻量级 Agent 推理发现存储 MCP 工具 — 带可信度标注、推理链追溯、级联降级、冲突检测。
+> 同时支持 **DAG 推理链**和**树状项目结构**两个维度组织信息。
 > 专为 CTF 逆向多 Agent 工作流设计，区分观察与推断，防止幻觉级联。
 
 [English docs / 英文文档](README.md)
@@ -18,6 +19,33 @@ Agent 每完成一步推理，记录一条发现。核心价值：
 - **推理链可追溯**：推翻一条，所有下游推断自动失效
 - **证据不丢失**：推翻结论后原始证据仍可召回
 - **角色权责分明**：子 Agent 可标 confirmed-observed / likely，但不可标 confirmed-inferred / speculative
+
+### 二维信息组织：DAG + Tree
+
+每条发现同时参与两个维度的结构：
+
+| 维度 | 含义 | 问题 | 实现 |
+|------|------|------|------|
+| **DAG（推理链）** | 结论之间的推导依赖（"因为 A 所以 B"） | **怎么推出来的？** | `based_on` 字段 |
+| **Tree（结构树）** | 结论所在的项目/文件/函数位置 | **在哪里发现的？** | `tree_nodes` 表 + `tree_node_id` |
+
+```
+                    DAG（推理链）
+          [观察] ──→ [推断] ──→ [结论]
+                        ↓ 推翻！
+                    [级联失效]
+
+                    Tree（结构树）
+          Project
+            ├── challenge.exe
+            │     ├── sub_4012a0
+            │     │     ├── Finding: "TEA 解密特征"
+            │     │     └── Finding: "密钥来自 0x403000"
+            │     └── sub_402000
+            │           └── Finding: "VirtualAlloc 调用"
+            └── data.bin
+                  └── Finding: "前 16 字节是 IV"
+```
 
 ---
 
@@ -42,12 +70,16 @@ Agent 每完成一步推理，记录一条发现。核心价值：
   "project": "HITCON2024_rev1",
   "fact": "sub_4012a0 在 0x401310 处读取 qword_40A0，与 0x9E3779B9 异或，符合 TEA 解密特征",
   "confidence": "confirmed-observed",
-  "source": "tool:ida:sub_4012a0",
+  "source": "tool:ida",
   "evidence": "mov rax,[rip+0x40A0]; xor rax,0x9E3779B9; 循环 32 轮",
   "based_on": "<parent-finding-id>",
-  "tags": ["binary:challenge.exe", "crypto", "tea"]
+  "tags": ["crypto", "tea"],
+  "tree_path": "challenge.exe>sub_4012a0"
 }
 ```
+
+新增可选参数：
+- `tree_path` — 树状结构路径，`>` 分隔层级（如 `"challenge.exe>sub_4012a0"`）。自动创建路径上所有缺失节点，并将 finding 挂载到叶子节点。
 
 存入 `confirmed-observed` / `confirmed-inferred` / `disproved` 时自动检测与已有条目冲突，返回 `_conflicts` 列表。
 
@@ -59,9 +91,13 @@ Agent 每完成一步推理，记录一条发现。核心价值：
   "query": "TEA",
   "confidence": "verified",
   "tag": "crypto",
+  "tree_node_id": "HITCON2024_rev1>challenge.exe>sub_4012a0",
   "limit": 20
 }
 ```
+
+新增可选参数：
+- `tree_node_id` — 过滤特定树节点下所有 findings
 
 搜索规则：`query` 对 fact/evidence 做文本匹配。confidence 快捷方式：
 - `"verified"` → confirmed-observed + confirmed-inferred + disproved（全部已验证条目）
@@ -79,6 +115,61 @@ Agent 每完成一步推理，记录一条发现。核心价值：
 将条目标为 `disproved` 时自动触发：
 - 所有 `based_on` 指向此 ID 的条目 → 降级为 `speculative` + 追加 `invalidated` 标签
 - 递归处理二级依赖
+
+---
+
+### tree_store — 创建/更新树节点
+
+```json
+{
+  "project": "HITCON2024_rev1",
+  "path": "challenge.exe>sub_4012a0>loop_body",
+  "node_type": "function",
+  "parent_path": null
+}
+```
+
+自动创建路径上所有缺失的中间节点（中间节点默认类型为 `section`）。
+
+节点类型：`project` | `file` | `function` | `class` | `section`
+
+`parent_path` 可选：指定父路径后，`path` 拼接到父路径下。
+
+### tree_get — 获取树节点
+
+```json
+{
+  "project": "HITCON2024_rev1",
+  "node_id": "HITCON2024_rev1>challenge.exe>sub_4012a0"
+}
+```
+
+返回节点信息 + 子节点列表 + 直接挂载的 findings + 父节点摘要。
+
+### tree_search — 搜索树节点
+
+```json
+{
+  "project": "HITCON2024_rev1",
+  "query": "sub_401",
+  "node_type": "function",
+  "parent_id": "HITCON2024_rev1>challenge.exe",
+  "limit": 50
+}
+```
+
+按名称、类型、父节点过滤。
+
+### tree_delete — 删除树节点
+
+```json
+{
+  "project": "HITCON2024_rev1",
+  "node_id": "HITCON2024_rev1>challenge.exe>sub_4012a0"
+}
+```
+
+级联删除所有子节点。挂载的 findings 保留（`tree_node_id` 置 NULL），数据不丢失。
 
 ---
 
@@ -129,6 +220,8 @@ mcp_servers:
 ```
 ~/.hermes/findings/               # 可通过 FINDINGS_DB_DIR 环境变量修改
 ├── HITCON2024_rev1.db            # 每个项目独立 SQLite 文件
+│   ├── knowledge                 # 发现表（含 tree_node_id）
+│   └── tree_nodes                # 树节点表（自引用层级结构）
 ├── pbb_new.db
 └── some-project.db
 ```
@@ -153,19 +246,32 @@ mcp_servers:
 交叉验证和 speculative 假设是父 Agent 的特权。
 
 重要结论前，先调用 findings_search 检查是否有 confirmed 直接答案或 disproved 冲突。
+
+## 树状结构使用
+
+推荐在 findings_store 时传入 tree_path 参数，将发现挂载到对应的项目结构中：
+- 路径格式：">" 分隔层级，如 "challenge.exe>sub_4012a0>loop_body"
+- 叶子节点类型默认 function，中间节点自动创建为 section
+- 需要指定文件类型时用 tree_store 预先创建：tree_store(project, path, node_type="file")
+- 查询时通过 tree_node_id 精确过滤：findings_search(project, tree_node_id="HITCON2024>challenge.exe>sub_4012a0")
+- 浏览结构：tree_get(project, node_id="HITCON2024>challenge.exe") 查看文件下所有函数和发现
+
+tags 只保留语义标签（如 "crypto"、"rc4"），位置信息由 tree_path 编码。
 ```
 
 ---
 
-## 从 v1（4 级）迁移
+## 从 v2（5 级置信度）迁移
 
-v2 将 `confirmed` 拆分为 `confirmed-observed` 和 `confirmed-inferred`，并新增了角色权限语义。
-已有数据库在首次连接时自动迁移（移除旧 CHECK 约束，应用层校验代替）。
+v3 新增了树状结构支持。已有数据库在首次连接时自动迁移（添加 `tree_node_id` 列和 `tree_nodes` 表）。
 
-向后兼容：
+已有 findings 的 `tree_node_id` 为 NULL，不影响现有功能。可后续通过 `findings_update` 补充树节点关联。
+
+### v1（4 级）→ v2（5 级）迁移
+
+v2 将 `confirmed` 拆分为 `confirmed-observed` 和 `confirmed-inferred`。向后兼容：
 - `findings_search` 中 `confidence="confirmed"` 快捷匹配 confirmed-observed + confirmed-inferred
 - `confidence="verified"` 匹配 confirmed-observed + confirmed-inferred + disproved
-- 已有 `confirmed` 数据保留在 DB 中，只是再存入时需用新值
 
 ---
 
