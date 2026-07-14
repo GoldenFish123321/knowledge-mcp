@@ -567,18 +567,19 @@ def get_finding(project: str, kid: str) -> dict | None:
 
 def update_finding(project: str, kid: str, fact: str | None = None,
                    confidence: str | None = None, evidence: str | None = None,
-                   tags: list[str] | None = None) -> dict:
-    """更新发现条目。标 disproved 时触发级联降级。"""
+                   tags: list[str] | None = None,
+                   tree_path: str | None = None) -> dict:
+    """更新发现条目。标 disproved 时触发级联降级。tree_path 可选，关联到树节点。"""
     conn = _get_conn(project)
-    
+
     existing = conn.execute("SELECT * FROM knowledge WHERE id = ?", (kid,)).fetchone()
     if not existing:
         conn.close()
         raise ValueError(f"Finding not found: {kid}")
-    
+
     updates = []
     params = []
-    
+
     if fact is not None:
         if len(fact) > MAX_FACT_LENGTH:
             conn.close()
@@ -597,22 +598,26 @@ def update_finding(project: str, kid: str, fact: str | None = None,
     if tags is not None:
         updates.append("tags = ?")
         params.append(json.dumps(tags, ensure_ascii=False))
-    
+    if tree_path is not None:
+        tree_node_id = _ensure_tree_path(conn, project, tree_path)
+        updates.append("tree_node_id = ?")
+        params.append(tree_node_id)
+
     if not updates:
         conn.close()
         return _row_to_dict(existing)
-    
+
     updates.append("updated_at = ?")
     params.append(_now())
     params.append(kid)
-    
+
     conn.execute(f"UPDATE knowledge SET {', '.join(updates)} WHERE id = ?", params)
     conn.commit()
-    
+
     # 如果标为 disproved，级联降级依赖者
     if confidence == "disproved" and existing["confidence"] != "disproved":
         _cascade_invalidate(conn, kid)
-    
+
     # 冲突检测
     new_fact = fact if fact is not None else existing["fact"]
     new_confidence = confidence if confidence is not None else existing["confidence"]
@@ -630,39 +635,6 @@ def update_finding(project: str, kid: str, fact: str | None = None,
     if conflicts:
         result["_conflicts"] = conflicts
     
-    conn.close()
-    return result
-
-
-def link_finding_to_tree(project: str, finding_id: str,
-                         tree_path: str) -> dict:
-    """将已有 finding 关联到树节点（创建/挂载）。
-
-    一般情况不得使用——新 findings 应通过 findings_store 的 tree_path 参数直接挂载。
-    仅当用户明确要求整理已有 findings 的树结构时使用。
-    """
-    conn = _get_conn(project)
-
-    existing = conn.execute(
-        "SELECT * FROM knowledge WHERE id = ?", (finding_id,)
-    ).fetchone()
-    if not existing:
-        conn.close()
-        raise ValueError(f"Finding not found: {finding_id}")
-
-    tree_node_id = _ensure_tree_path(conn, project, tree_path)
-    now = _now()
-
-    conn.execute(
-        "UPDATE knowledge SET tree_node_id = ?, updated_at = ? WHERE id = ?",
-        (tree_node_id, now, finding_id)
-    )
-    conn.commit()
-
-    row = conn.execute(
-        "SELECT * FROM knowledge WHERE id = ?", (finding_id,)
-    ).fetchone()
-    result = _row_to_dict(row)
     conn.close()
     return result
 
@@ -764,7 +736,10 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="findings_update",
-            description="""更新发现条目的置信度、证据或标签。
+            description="""更新发现条目的置信度、证据、标签或树节点关联。
+
+⚠️ tree_path 一般情况不得使用——新 findings 应通过 findings_store 的 tree_path 参数直接挂载。
+仅当用户明确要求整理已有 findings 的树结构时才传入此参数。
 
 将条目标记为 disproved 时自动级联：
   - 所有 based_on 指向此条目的推断 → 降级为 speculative
@@ -779,7 +754,8 @@ async def list_tools() -> list[Tool]:
   fact       — 新的事实陈述（可选）
   confidence — 新的置信度（可选）
   evidence   — 新的证据（可选）
-  tags       — 新的标签列表（可选，完整替换）""",
+  tags       — 新的标签列表（可选，完整替换）
+  tree_path  — 树路径，如 'challenge.exe>sub_4012a0'（⚠️ 一般不用，仅用户要求时使用）""",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -789,6 +765,7 @@ async def list_tools() -> list[Tool]:
                     "confidence": {"type": "string", "enum": sorted(VALID_CONFIDENCE)},
                     "evidence": {"type": "string"},
                     "tags": {"type": "array", "items": {"type": "string"}},
+                    "tree_path": {"type": "string", "description": "树路径，如 'challenge.exe>sub_4012a0'（⚠️ 一般不用）"},
                 },
                 "required": ["project", "id"],
             },
@@ -887,28 +864,6 @@ async def list_tools() -> list[Tool]:
                 "required": ["project", "node_id"],
             },
         ),
-        Tool(
-            name="findings_link_tree",
-            description="""⚠️ 一般情况不得使用。仅当用户明确要求整理已有 findings 的树结构时使用。
-
-将已有 finding 关联到树节点。自动创建路径上所有缺失节点。
-
-新 findings 应通过 findings_store 的 tree_path 参数直接挂载，无需事后调用此工具。
-
-参数:
-  project     — 项目名
-  finding_id  — finding ID
-  tree_path   — 树路径，如 'challenge.exe>sub_4012a0'（> 分隔层级）""",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "project": {"type": "string", "description": "项目名"},
-                    "finding_id": {"type": "string", "description": "finding ID"},
-                    "tree_path": {"type": "string", "description": "树路径，如 'challenge.exe>sub_4012a0'"},
-                },
-                "required": ["project", "finding_id", "tree_path"],
-            },
-        ),
     ]
 
 
@@ -956,6 +911,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 confidence=arguments.get("confidence"),
                 evidence=arguments.get("evidence"),
                 tags=arguments.get("tags"),
+                tree_path=arguments.get("tree_path"),
             )
             return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
 
@@ -992,14 +948,6 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             result = tree_delete(
                 project=arguments["project"],
                 node_id=arguments["node_id"],
-            )
-            return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
-
-        elif name == "findings_link_tree":
-            result = link_finding_to_tree(
-                project=arguments["project"],
-                finding_id=arguments["finding_id"],
-                tree_path=arguments["tree_path"],
             )
             return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
 
