@@ -634,6 +634,39 @@ def update_finding(project: str, kid: str, fact: str | None = None,
     return result
 
 
+def link_finding_to_tree(project: str, finding_id: str,
+                         tree_path: str) -> dict:
+    """将已有 finding 关联到树节点（创建/挂载）。
+
+    一般情况不得使用——新 findings 应通过 findings_store 的 tree_path 参数直接挂载。
+    仅当用户明确要求整理已有 findings 的树结构时使用。
+    """
+    conn = _get_conn(project)
+
+    existing = conn.execute(
+        "SELECT * FROM knowledge WHERE id = ?", (finding_id,)
+    ).fetchone()
+    if not existing:
+        conn.close()
+        raise ValueError(f"Finding not found: {finding_id}")
+
+    tree_node_id = _ensure_tree_path(conn, project, tree_path)
+    now = _now()
+
+    conn.execute(
+        "UPDATE knowledge SET tree_node_id = ?, updated_at = ? WHERE id = ?",
+        (tree_node_id, now, finding_id)
+    )
+    conn.commit()
+
+    row = conn.execute(
+        "SELECT * FROM knowledge WHERE id = ?", (finding_id,)
+    ).fetchone()
+    result = _row_to_dict(row)
+    conn.close()
+    return result
+
+
 # ─── MCP Server ────────────────────────────────────────────────────
 
 server = Server("findings-mcp")
@@ -854,6 +887,28 @@ async def list_tools() -> list[Tool]:
                 "required": ["project", "node_id"],
             },
         ),
+        Tool(
+            name="findings_link_tree",
+            description="""⚠️ 一般情况不得使用。仅当用户明确要求整理已有 findings 的树结构时使用。
+
+将已有 finding 关联到树节点。自动创建路径上所有缺失节点。
+
+新 findings 应通过 findings_store 的 tree_path 参数直接挂载，无需事后调用此工具。
+
+参数:
+  project     — 项目名
+  finding_id  — finding ID
+  tree_path   — 树路径，如 'challenge.exe>sub_4012a0'（> 分隔层级）""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "项目名"},
+                    "finding_id": {"type": "string", "description": "finding ID"},
+                    "tree_path": {"type": "string", "description": "树路径，如 'challenge.exe>sub_4012a0'"},
+                },
+                "required": ["project", "finding_id", "tree_path"],
+            },
+        ),
     ]
 
 
@@ -937,6 +992,14 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             result = tree_delete(
                 project=arguments["project"],
                 node_id=arguments["node_id"],
+            )
+            return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+
+        elif name == "findings_link_tree":
+            result = link_finding_to_tree(
+                project=arguments["project"],
+                finding_id=arguments["finding_id"],
+                tree_path=arguments["tree_path"],
             )
             return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
 
