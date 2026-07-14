@@ -147,14 +147,17 @@ def _get_conn(project: str) -> sqlite3.Connection:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_project_conf ON knowledge(project, confidence)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_project_tags ON knowledge(project, tags)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_based_on ON knowledge(project, based_on)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_knowledge_tree_node ON knowledge(project, tree_node_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tree_project ON tree_nodes(project)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tree_parent ON tree_nodes(project, parent_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tree_type ON tree_nodes(project, node_type)")
     conn.commit()
 
-    # 迁移旧 schema（无操作幂等）
+    # 迁移旧 schema（必须在 tree_node_id 索引之前，因为旧 DB 还没有该列）
     _migrate_schema(conn)
+
+    # tree_node_id 索引在迁移之后创建（迁移会添加该列）
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_knowledge_tree_node ON knowledge(project, tree_node_id)")
+    conn.commit()
     return conn
 
 
