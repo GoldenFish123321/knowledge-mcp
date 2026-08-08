@@ -51,6 +51,17 @@ TREE_SEP = ">"
 # 需要冲突检测的置信度——所有"已确认/已证伪"的级别
 _CONFLICT_CHECK_CONFIDENCE = {"confirmed-observed", "confirmed-inferred", "disproved"}
 
+# ─── v1.1 写库 gate 常量 ───────────────────────────────────────────
+# 信息对象四类 type（v2 §6.4 / v1.1 §1.3 ②）
+VALID_TYPES = {"observation", "claim", "hypothesis", "task"}
+
+# 子 Agent 角色——禁止标记 confirmed-inferred / speculative（v1.1 §1.3 ①）
+_SUBAGENT_ROLES = {"discovery", "detector", "judge", "analyst", "leaf"}
+
+# 角色受限置信度——仅父 Agent（role=parent）可标记；
+# role 缺失/无法解析 → 默认拒绝（宁严勿松）；confirmed-observed/likely/disproved 不受角色限制
+_ROLE_GATED_CONFIDENCE = {"confirmed-inferred", "speculative"}
+
 # ─── SQLite 数据层 ────────────────────────────────────────────────
 
 def _get_db_path(project: str) -> Path:
@@ -619,17 +630,173 @@ def _check_conflicts(conn: sqlite3.Connection, project: str, fact: str,
     return [_row_to_dict(r) for r in rows]
 
 
+# ─── v1.1 写库 gate ────────────────────────────────────────────────
+# ④ 只做结构校验，不做语义校验（职责边界，v1.1 §1.3 / gap-plan D2 末条）：
+#    MCP 校验的是"结构存在性"——based_on 引用的 ID 存在吗？是 observation 类型吗？
+#    evidence 里有两个不同 agent-id 标记吗？fact 含 'test_plan:' 吗？budget 三字段齐全吗？
+#    "evidence 是否真的支持 statement"、"claim 结论是否与 observation 一致"这类语义匹配
+#    是检测型子 Agent 的职责（v2 §6.4：真实存在归 MCP，匹配 statement 归检测型），
+#    MCP 不假装理解语义——这是职责边界，不是疏漏。
+
+def _parse_source_role(source: str | None) -> str | None:
+    """从 source 解析 role（约定格式 agent:<id>|role:<role>|tool:<tool>）。
+
+    大小写不敏感，返回小写 role；role 缺失/格式无法解析返回 None。
+    """
+    import re
+    if not source:
+        return None
+    m = re.search(r'role:([A-Za-z0-9_\-]+)', source)
+    return m.group(1).lower() if m else None
+
+
+def _check_role_authority(source: str | None, confidence: str) -> None:
+    """① 角色权责（v1.1 §1.3 ① / v2 §5.1）：
+    - 子 Agent（discovery/detector/judge/analyst/leaf）标 confirmed-inferred / speculative → 拒绝
+    - role=parent → 允许
+    - role 缺失/无法解析 → 默认拒绝（宁严勿松）
+    - confirmed-observed / likely / disproved 不受角色限制（子 Agent 可标）
+    通过返回 None；失败 raise ValueError（write_gate_violation 格式）。
+    """
+    role = _parse_source_role(source)
+    if confidence not in _ROLE_GATED_CONFIDENCE:
+        return
+    if role is None:
+        raise ValueError(
+            "write_gate_violation: source 无法解析 role（缺失或格式不符），"
+            f"{confidence} 仅限父 Agent（role=parent）标记 | "
+            "suggestion: 在 source 中带上 role:parent，或改由父 Agent 提交"
+        )
+    if role in _SUBAGENT_ROLES:
+        if confidence == "confirmed-inferred":
+            suggestion = "改为 likely 提交，由父 Agent 交叉验证后升级"
+        else:
+            suggestion = "由父 Agent 提出"
+        raise ValueError(
+            f"write_gate_violation: role={role} 无权标记 {confidence} | "
+            f"suggestion: {suggestion}"
+        )
+    if role != "parent":
+        raise ValueError(
+            f"write_gate_violation: 未知 role={role} 无权标记 {confidence} | "
+            "suggestion: 使用 role:parent，或由父 Agent 提交"
+        )
+
+
+def _check_cross_validation(evidence: str) -> None:
+    """③ confirmed-inferred 交叉验证标记：evidence 必须含两个不同 agent-id。"""
+    import re
+    agent_ids = re.findall(r'agent:([A-Za-z0-9_\-]+)', evidence or "")
+    if len(set(agent_ids)) < 2:
+        raise ValueError(
+            "write_gate_violation: confirmed-inferred 需两个独立子 Agent 交叉验证"
+            "（evidence 必须含两个不同 agent:<id> 标记） | "
+            "suggestion: 在 evidence 中追加第二个独立 agent 的验证记录，"
+            "如 'agent:xxx 复核一致'"
+        )
+
+
+def _validate_write_gate(conn: sqlite3.Connection, confidence: str, type_: str,
+                         based_on: str | None, source: str | None, fact: str,
+                         task_budget: dict | None = None,
+                         evidence: str = "") -> None:
+    """写库 gate：四层结构校验（v1.1 §1.3 / gap-plan D2）。
+
+    ① 角色权责：子 Agent 禁标 confirmed-inferred/speculative；role 缺失默认拒绝
+    ② type 校验：claim 必须 based_on ≥1 条 observation（ID 存在且 type=observation）；
+       hypothesis 必须含 'test_plan:'；task 必须带完整 budget 三字段；type 必须是合法枚举
+    ③ confirmed-inferred：evidence 必须含两个不同 agent-id（交叉验证标记）
+    ④ 只做结构校验，不做语义校验（见上方职责边界注释）
+
+    通过返回 None；失败 raise ValueError，消息格式：
+    "write_gate_violation: <reason> | suggestion: <suggestion>"
+    """
+    # ① 角色权责
+    _check_role_authority(source, confidence)
+
+    # ② type 校验
+    if type_ not in VALID_TYPES:
+        raise ValueError(
+            f"write_gate_violation: 非法 type={type_!r}，合法值: "
+            "observation/claim/hypothesis/task | "
+            "suggestion: 改为合法 type 后重试"
+        )
+    if type_ == "claim":
+        if not based_on:
+            raise ValueError(
+                "write_gate_violation: claim 必须引用 ≥1 observation（based_on 为空） | "
+                "suggestion: 补充 based_on 指向一条 observation 的 finding ID"
+            )
+        ref = conn.execute(
+            "SELECT type FROM knowledge WHERE id = ?", (based_on,)
+        ).fetchone()
+        if ref is None:
+            raise ValueError(
+                f"write_gate_violation: claim 的 based_on 引用不存在的 finding: {based_on} | "
+                "suggestion: 先存储对应的 observation，再引用其 ID"
+            )
+        if ref["type"] != "observation":
+            raise ValueError(
+                f"write_gate_violation: claim 的 based_on 必须引用 observation"
+                f"（{based_on} 的类型是 {ref['type']}） | "
+                "suggestion: 将 based_on 改为指向 observation 类型的 finding"
+            )
+    elif type_ == "hypothesis":
+        if "test_plan:" not in fact:
+            raise ValueError(
+                "write_gate_violation: hypothesis 的 fact 必须含 'test_plan:' 段 | "
+                "suggestion: 在 fact 中追加 test_plan: <验证步骤>"
+            )
+    elif type_ == "task":
+        if not isinstance(task_budget, dict):
+            raise ValueError(
+                "write_gate_violation: task 必须提供 task_budget"
+                "（含 budget_tool_calls/budget_tokens/budget_seconds） | "
+                "suggestion: 传入 task_budget={'budget_tool_calls': N, "
+                "'budget_tokens': N, 'budget_seconds': N}"
+            )
+        missing = [k for k in ("budget_tool_calls", "budget_tokens", "budget_seconds")
+                   if k not in task_budget]
+        if missing:
+            raise ValueError(
+                f"write_gate_violation: task 的 task_budget 缺失字段: {missing} | "
+                "suggestion: 补齐 budget_tool_calls/budget_tokens/budget_seconds 三字段"
+            )
+
+    # ③ confirmed-inferred 交叉验证标记
+    if confidence == "confirmed-inferred":
+        _check_cross_validation(evidence)
+
+
 def store_finding(project: str, fact: str, confidence: str, source: str,
                   evidence: str = "", based_on: str | None = None,
                   tags: list[str] | None = None,
-                  tree_path: str | None = None) -> dict:
-    """存储一条发现。tree_path 可选，自动创建关联的树节点。"""
+                  tree_path: str | None = None,
+                  type_: str = "claim",
+                  task_budget: dict | None = None,
+                  task_dependencies: list | None = None,
+                  task_agent: str | None = None) -> dict:
+    """存储一条发现。tree_path 可选，自动创建关联的树节点。
+
+    v1.1 写库 gate：INSERT 前做四层结构校验（角色权责 / type 校验 /
+    confirmed-inferred 交叉验证标记），失败 raise ValueError（write_gate_violation）。
+    type=task 时同步写入 task_meta（budget 三字段 + agent + dependencies_json）。
+    """
     if confidence not in VALID_CONFIDENCE:
         raise ValueError(f"Invalid confidence: {confidence}. Must be one of {VALID_CONFIDENCE}")
     if len(fact) > MAX_FACT_LENGTH:
         raise ValueError(f"Fact too long ({len(fact)} chars). Max is {MAX_FACT_LENGTH}")
 
     conn = _get_conn(project)
+
+    # ── 写库 gate（INSERT 前，v1.1 §1.3）──
+    try:
+        _validate_write_gate(conn, confidence, type_, based_on, source, fact,
+                             task_budget=task_budget, evidence=evidence)
+    except ValueError:
+        conn.close()
+        raise
+
     kid = str(uuid.uuid4())
     now = _now()
     tags_json = json.dumps(tags or [], ensure_ascii=False)
@@ -639,18 +806,30 @@ def store_finding(project: str, fact: str, confidence: str, source: str,
     if tree_path:
         tree_node_id = _ensure_tree_path(conn, project, tree_path)
 
-    # 如果 based_on 引用了不存在条目，置空
-    if based_on:
+    # 非 claim 类型若 based_on 引用不存在条目，静默置空（兼容旧行为；
+    # claim 的 based_on 已由 gate 保证存在且为 observation 类型）
+    if based_on and type_ != "claim":
         exists = conn.execute("SELECT 1 FROM knowledge WHERE id = ?", (based_on,)).fetchone()
         if not exists:
             based_on = None
 
     conn.execute("""
         INSERT INTO knowledge (id, project, fact, confidence, source, evidence,
-                               based_on, tags, tree_node_id, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                               based_on, tags, tree_node_id, type, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (kid, project, fact, confidence, source, evidence, based_on, tags_json,
-          tree_node_id, now, now))
+          tree_node_id, type_, now, now))
+
+    # type=task：同步写入 task_meta（budget 三字段 + agent + dependencies_json，hypothesis_id 可空）
+    if type_ == "task":
+        conn.execute("""
+            INSERT INTO task_meta (finding_id, agent, budget_tool_calls,
+                                   budget_tokens, budget_seconds, dependencies_json)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (kid, task_agent, task_budget["budget_tool_calls"],
+              task_budget["budget_tokens"], task_budget["budget_seconds"],
+              json.dumps(task_dependencies or [], ensure_ascii=False)))
+
     conn.commit()
 
     # 冲突检测
@@ -732,14 +911,32 @@ def get_finding(project: str, kid: str) -> dict | None:
 def update_finding(project: str, kid: str, fact: str | None = None,
                    confidence: str | None = None, evidence: str | None = None,
                    tags: list[str] | None = None,
-                   tree_path: str | None = None) -> dict:
-    """更新发现条目。标 disproved 时触发级联降级。tree_path 可选，关联到树节点。"""
+                   tree_path: str | None = None,
+                   source: str | None = None) -> dict:
+    """更新发现条目。标 disproved 时触发级联降级。tree_path 可选，关联到树节点。
+
+    v1.1 写库 gate（update 版）：只校验角色权责 + confirmed-inferred 交叉验证标记——
+    type 在 store 时已校验，update 一般只改置信度/证据，不重新做 type 校验。
+    """
     conn = _get_conn(project)
 
     existing = conn.execute("SELECT * FROM knowledge WHERE id = ?", (kid,)).fetchone()
     if not existing:
         conn.close()
         raise ValueError(f"Finding not found: {kid}")
+
+    # ── 写库 gate（update 版，v1.1 §1.3）：只校验角色权责（标 confirmed-inferred/speculative 时）
+    #    若改为 confirmed-inferred，还需 evidence 双 agent 交叉验证标记 ──
+    new_confidence = confidence if confidence is not None else existing["confidence"]
+    new_evidence = evidence if evidence is not None else existing["evidence"]
+    if new_confidence in _ROLE_GATED_CONFIDENCE:
+        try:
+            _check_role_authority(source, new_confidence)
+            if new_confidence == "confirmed-inferred":
+                _check_cross_validation(new_evidence)
+        except ValueError:
+            conn.close()
+            raise
 
     updates = []
     params = []
@@ -1044,6 +1241,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 based_on=arguments.get("based_on"),
                 tags=arguments.get("tags"),
                 tree_path=arguments.get("tree_path"),
+                type_=arguments.get("type", "claim"),
+                task_budget=arguments.get("task_budget"),
+                task_dependencies=arguments.get("task_dependencies"),
+                task_agent=arguments.get("task_agent"),
             )
             return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
 
@@ -1076,6 +1277,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 evidence=arguments.get("evidence"),
                 tags=arguments.get("tags"),
                 tree_path=arguments.get("tree_path"),
+                source=arguments.get("source"),
             )
             return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
 
