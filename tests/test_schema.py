@@ -161,7 +161,7 @@ class TestLegacyMigration(harness.HarnessTestCase):
                 "SELECT id, fact, confidence FROM knowledge ORDER BY id").fetchall()
             self.assertEqual(len(rows), 2, "迁移后数据行数不变")
             self.assertEqual(rows[0]["fact"], "old fact alpha 0x7f00")
-            self.assertEqual(rows[0]["confidence"], "confirmed")
+            self.assertEqual(rows[0]["confidence"], "confirmed-observed")
             self.assertEqual(rows[1]["confidence"], "likely")
         finally:
             conn.close()

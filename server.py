@@ -93,6 +93,14 @@ def _migrate_schema(conn: sqlite3.Connection):
 
     # ── 迁移 1：旧版 4 级置信度 → 新版 5 级 ──
     if "'confirmed','disproved','likely','speculative'" in schema_sql:
+        # P0 审查修复（迁移崩溃路径）：
+        # a) 显式列清单 INSERT——原 `SELECT *` 在中间态库（4 级 CHECK + tree_node_id 并存，
+        #    旧表 11 列 vs 新表 10 列）时列数不匹配 → OperationalError 首连永久失败
+        # b) 迁移期间 PRAGMA foreign_keys=OFF——旧库可能含外键关闭期写入的 dangling based_on，
+        #    FK ON 下迁移 INSERT 抛 IntegrityError 首连永久失败；且 SELECT 行序不保证父先于子
+        # c) 旧 'confirmed' 值映射到 5 级枚举 'confirmed-observed'（否则搜索/过滤不可见，僵尸数据）
+        # d) 清洗 dangling based_on（迁移期 FK 关闭写入的悬空引用置 NULL）
+        conn.execute("PRAGMA foreign_keys=OFF")
         conn.execute("ALTER TABLE knowledge RENAME TO knowledge_old")
         conn.execute("""
             CREATE TABLE knowledge (
@@ -109,7 +117,21 @@ def _migrate_schema(conn: sqlite3.Connection):
                 FOREIGN KEY (based_on) REFERENCES knowledge(id) ON DELETE SET NULL
             )
         """)
-        conn.execute("INSERT INTO knowledge SELECT * FROM knowledge_old")
+        conn.execute("""
+            INSERT INTO knowledge (id, project, fact, confidence, source, evidence,
+                                   based_on, tags, created_at, updated_at)
+            SELECT id, project, fact, confidence, source, evidence,
+                   based_on, tags, created_at, updated_at
+            FROM knowledge_old
+        """)
+        conn.execute(
+            "UPDATE knowledge SET confidence = 'confirmed-observed' "
+            "WHERE confidence = 'confirmed'"
+        )
+        conn.execute(
+            "UPDATE knowledge SET based_on = NULL "
+            "WHERE based_on IS NOT NULL AND based_on NOT IN (SELECT id FROM knowledge)"
+        )
         conn.execute("DROP TABLE knowledge_old")
         conn.commit()
         # 重新读取 schema
@@ -144,13 +166,42 @@ def _migrate_schema(conn: sqlite3.Connection):
         conn.execute("ALTER TABLE tree_nodes ADD COLUMN markers_json TEXT NOT NULL DEFAULT '[]'")
     conn.commit()
 
+    # P0 审查修复：迁移完成后恢复外键约束（迁移 1 期间关闭以容纳旧库 dangling based_on；
+    # 此句在最后一次 commit 之后执行，无挂起事务，PRAGMA 生效）
+    conn.execute("PRAGMA foreign_keys=ON")
+
 
 def _get_conn(project: str) -> sqlite3.Connection:
-    """获取项目数据库连接，自动建表并迁移旧 schema。"""
+    """获取项目数据库连接（含并发初始化锁重试）。
+
+    每次连接都执行 DDL 初始化（CREATE TABLE/INDEX/FTS 触发器），多进程/多线程
+    并发首次打开同一项目库时写锁竞争会抛 database is locked——这里整体重试
+    （busy_timeout 30s 等待单语句锁，退避重试兜底初始化阶段的锁冲突）。
+    """
+    import time as _time
     db_path = _get_db_path(project)
+    last_exc = None
+    for _attempt in range(20):
+        try:
+            return _get_conn_inner(db_path)
+        except sqlite3.OperationalError as _e:
+            if "locked" not in str(_e).lower():
+                raise
+            last_exc = _e
+            _time.sleep(0.1 * (_attempt + 1))
+    raise RuntimeError(
+        f"_get_conn 初始化 20 次仍失败（database is locked）: {last_exc}"
+    )
+
+
+def _get_conn_inner(db_path) -> sqlite3.Connection:
+    """内部实现：打开连接 + DDL 初始化 + 迁移 + FTS 索引。"""
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    # 并发写等待锁（默认 busy_timeout=0 立即报 database is locked；MCP server 与
+    # 多个子 Agent 并发写入是真实场景，等待 30s 让锁竞争自然解决）
+    conn.execute("PRAGMA busy_timeout=30000")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS knowledge (
@@ -254,18 +305,20 @@ def _get_conn(project: str) -> sqlite3.Connection:
         "task_status     TEXT NOT NULL DEFAULT 'todo',"
         "dependencies_json TEXT NOT NULL DEFAULT '[]'"
         ")")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_project_conf ON knowledge(project, confidence)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_project_tags ON knowledge(project, tags)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_based_on ON knowledge(project, based_on)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tree_project ON tree_nodes(project)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tree_parent ON tree_nodes(project, parent_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tree_type ON tree_nodes(project, node_type)")
     conn.commit()
 
-    # 迁移旧 schema（必须在 tree_node_id 索引之前，因为旧 DB 还没有该列）
+    # 迁移旧 schema（必须在 knowledge 索引之前：迁移 1 的 RENAME+DROP 会把旧表上的索引带走）
     _migrate_schema(conn)
 
-    # tree_node_id 索引在迁移之后创建（迁移会添加该列）
+    # knowledge 索引在迁移之后创建（P0 审查修复：原实现建在迁移前，迁移 1 重建表后
+    # idx_project_conf/idx_project_tags/idx_based_on 随 knowledge_old 被 DROP 永久丢失；
+    # tree_node_id 列由迁移 2 添加，idx_knowledge_tree_node 同样必须在此之后）
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_project_conf ON knowledge(project, confidence)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_project_tags ON knowledge(project, tags)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_based_on ON knowledge(project, based_on)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_knowledge_tree_node ON knowledge(project, tree_node_id)")
     conn.commit()
 
@@ -430,28 +483,28 @@ def tree_store(project: str, path: str, node_type: str = "function",
         raise ValueError(f"Invalid node_type: {node_type}. Must be one of {VALID_NODE_TYPES}")
 
     conn = _get_conn(project)
+    try:
+        # 构建完整路径
+        if parent_path:
+            segments = _parse_tree_path(parent_path) + _parse_tree_path(path)
+        else:
+            segments = _parse_tree_path(path)
 
-    # 构建完整路径
-    if parent_path:
-        segments = _parse_tree_path(parent_path) + _parse_tree_path(path)
-    else:
-        segments = _parse_tree_path(path)
+        if not segments:
+            raise ValueError("path cannot be empty")
 
-    if not segments:
+        node_id = _ensure_tree_path(conn, project,
+                                    TREE_SEP.join(segments), node_type)
+
+        # 获取完整节点信息
+        row = conn.execute(
+            "SELECT * FROM tree_nodes WHERE id = ?", (node_id,)
+        ).fetchone()
+        return _tree_node_to_dict(row)
+    finally:
+        # P0 审查修复：所有路径关闭连接（原实现 _ensure_tree_path ValueError
+        # 如 tree_path=">" 空段时连接不关闭）
         conn.close()
-        raise ValueError("path cannot be empty")
-
-    node_id = _ensure_tree_path(conn, project,
-                                TREE_SEP.join(segments), node_type)
-
-    # 获取完整节点信息
-    row = conn.execute(
-        "SELECT * FROM tree_nodes WHERE id = ?", (node_id,)
-    ).fetchone()
-    result = _tree_node_to_dict(row)
-
-    conn.close()
-    return result
 
 
 def tree_get(project: str, node_id: str) -> dict | None:
@@ -1265,14 +1318,34 @@ def directive_create(project: str, text: str, anchor: str | None = None,
 
     conn = _get_conn(project)
     try:
-        did = _next_directive_id(conn, project)
         created_at = _now()
-        conn.execute(
-            "INSERT INTO directives (id, project, text, anchor, type, status, repeat_count, created_at) "
-            "VALUES (?, ?, ?, ?, ?, 'received', 0, ?)",
-            (did, project, text, parsed["anchor"], resolved_type, created_at),
-        )
-        conn.commit()
+        did = None
+        # P0 审查修复：_next_directive_id 是"查 max+1 + 撞号顺延"的非原子序列，
+        # 并发下多个连接算出同一 D-XXXX → INSERT 撞主键 IntegrityError 丢数据。
+        # 撞号（IntegrityError）→ 立即重试取新号；锁竞争（OperationalError locked）
+        # → 退避重试等待写锁释放（最多 10 次）。
+        import time as _time
+        for _attempt in range(10):
+            try:
+                did = _next_directive_id(conn, project)
+                conn.execute(
+                    "INSERT INTO directives (id, project, text, anchor, type, status, repeat_count, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, 'received', 0, ?)",
+                    (did, project, text, parsed["anchor"], resolved_type, created_at),
+                )
+                conn.commit()
+                break
+            except sqlite3.IntegrityError:
+                conn.rollback()  # 撞号：重新取号立即重试
+            except sqlite3.OperationalError as _e:
+                conn.rollback()
+                if "locked" not in str(_e).lower():
+                    raise
+                _time.sleep(0.05 * (_attempt + 1))  # 写锁退避（取号 SELECT 也可能锁）
+        else:
+            raise RuntimeError(
+                f"directive id 分配并发冲突 10 次仍失败（project={project}）"
+            )
     finally:
         conn.close()
     return {
@@ -1488,17 +1561,35 @@ def conflict_report(project: str, conflict_type: int,
 
     conn = _get_conn(project)
     try:
-        cid = _next_conflict_id(conn, project)
         created_at = _now()
-        conn.execute(
-            "INSERT INTO conflicts (id, project, conflict_type, party_a_id, party_a_summary, "
-            "party_a_evidence, party_b_id, party_b_summary, party_b_evidence, reporter, "
-            "status, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
-            (cid, project, conflict_type, party_a_id, party_a_summary, party_a_evidence,
-             party_b_id, party_b_summary, party_b_evidence, reporter, created_at, created_at),
-        )
-        conn.commit()
+        cid = None
+        # P0 审查修复：同 directive 的并发撞号问题——_next_conflict_id 非原子，
+        # 并发冲突报告算出同一 C-XXXX → IntegrityError 丢数据；锁竞争退避重试。
+        import time as _time
+        for _attempt in range(10):
+            try:
+                cid = _next_conflict_id(conn, project)
+                conn.execute(
+                    "INSERT INTO conflicts (id, project, conflict_type, party_a_id, party_a_summary, "
+                    "party_a_evidence, party_b_id, party_b_summary, party_b_evidence, reporter, "
+                    "status, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+                    (cid, project, conflict_type, party_a_id, party_a_summary, party_a_evidence,
+                     party_b_id, party_b_summary, party_b_evidence, reporter, created_at, created_at),
+                )
+                conn.commit()
+                break
+            except sqlite3.IntegrityError:
+                conn.rollback()  # 撞号：重新取号立即重试
+            except sqlite3.OperationalError as _e:
+                conn.rollback()
+                if "locked" not in str(_e).lower():
+                    raise
+                _time.sleep(0.05 * (_attempt + 1))  # 写锁退避（取号 SELECT 也可能锁）
+        else:
+            raise RuntimeError(
+                f"conflict id 分配并发冲突 10 次仍失败（project={project}）"
+            )
         row = conn.execute("SELECT * FROM conflicts WHERE id = ?", (cid,)).fetchone()
         result = _row_to_dict(row)
     finally:
@@ -1589,14 +1680,20 @@ def conflict_update(project: str, id: str, status: str | None = None,
     finally:
         conn.close()
 
-    # 联动：resolution 含 "disproved" → party_a 被否定，标 knowledge 条目为 disproved
-    # （update_finding 触发级联降级）。party_a_id 非 knowledge 条目（如 observation:xxx）
-    # 或已不存在 → 静默跳过；异常不中断裁决记录。
-    if "disproved" in (new_resolution or ""):
+    # 联动：仅终态（adjudicated/resolved_by_rerun）且 resolution 含 "disproved" 时，
+    # party_a 才被否定 → 标 knowledge 条目为 disproved（触发级联降级）。
+    # 非终态（pending/under_review）的 resolution 只是"待查/疑似"记录，不构成定案
+    # （P0 审查修复：原实现只看 resolution 文本不看 status → under_review 阶段就误降级）。
+    # party_a_id 非 knowledge 条目（如 observation:xxx）或已不存在 → 不中断裁决记录，
+    # 但原因附在返回的 warning 字段里（原实现 try/except pass 静默吞异常）。
+    warning = None
+    if new_status in ("adjudicated", "resolved_by_rerun") and "disproved" in (new_resolution or ""):
         try:
             update_finding(project, kid=party_a_id, confidence="disproved")
-        except Exception:
-            pass
+        except Exception as e:  # noqa: BLE001
+            warning = f"party_a 联动标记 disproved 失败: {e}"
+    if warning:
+        result["warning"] = warning
     return result
 
 
@@ -1912,28 +2009,48 @@ def _cascade_invalidate(conn: sqlite3.Connection, parent_id: str):
     """
     将被推翻条目的所有 based_on 依赖者降级为 speculative + 追加 invalidated 标签。
     递归处理二级依赖链。
-    仅对非 speculative 条目降级（已是 speculative 或 disproved 的跳过）。
+
+    实现要点（P0 审查修复，原实现是死代码——先 UPDATE 把直接依赖降级为
+    speculative，再按 `confidence NOT IN ('speculative','disproved')` 查 dependents，
+    刚被降级的行被排除 → dependents 恒为空 → 递归永不触发 → 二级依赖链不降级）：
+    1. 先递归收集全部子孙 ID（based_on 指向链），visited 集合防环（A→B→A 成环不死循环）
+    2. 收集完成后统一 UPDATE：所有子孙写 confidence='speculative' + invalidated 标签
+       + invalidation_reason（'上游 <parent_id> 被证伪'）
+    3. 已 speculative/disproved 的条目跳过降级（但仍是链上节点，其子孙继续收集）
     """
-    conn.execute("""
-        UPDATE knowledge 
+    def _collect_descendants(nid: str, visited: set) -> list[str]:
+        ids = []
+        rows = conn.execute(
+            "SELECT id FROM knowledge WHERE based_on = ?", (nid,)
+        ).fetchall()
+        for r in rows:
+            cid = r["id"]
+            if cid in visited:
+                continue  # 环状依赖防护
+            visited.add(cid)
+            ids.append(cid)
+            ids.extend(_collect_descendants(cid, visited))
+        return ids
+
+    descendants = _collect_descendants(parent_id, {parent_id})
+    if not descendants:
+        return
+    placeholders = ",".join("?" for _ in descendants)
+    conn.execute(
+        f"""
+        UPDATE knowledge
         SET confidence = 'speculative',
             tags = CASE
-                WHEN tags NOT LIKE '%invalidated%' 
+                WHEN tags NOT LIKE '%invalidated%'
                 THEN json_insert(tags, '$[#]', 'invalidated')
                 ELSE tags
             END,
+            invalidation_reason = ?,
             updated_at = ?
-        WHERE based_on = ? AND confidence NOT IN ('speculative', 'disproved')
-    """, (_now(), parent_id))
-    
-    # 递归处理被降级条目——它们降级后，依赖它们的也需要降级
-    dependents = conn.execute(
-        "SELECT id FROM knowledge WHERE based_on = ? AND confidence NOT IN ('speculative', 'disproved')",
-        (parent_id,)
-    ).fetchall()
-    for dep in dependents:
-        _cascade_invalidate(conn, dep["id"])
-    
+        WHERE id IN ({placeholders}) AND confidence NOT IN ('speculative', 'disproved')
+        """,
+        [f"上游 {parent_id} 被证伪", _now()] + descendants,
+    )
     conn.commit()
 
 
@@ -1946,7 +2063,11 @@ def _check_conflicts(conn: sqlite3.Connection, project: str, fact: str,
     返回冲突条目列表（不含自身）。
     """
     import re
+    # P0 审查修复：原正则只提 ASCII 词（[a-zA-Z0-9_]{3,}），纯中文 fact 提取 0 词 →
+    # return [] 静默失效（中文 CTF 场景大面积失效）。补 CJK 2-4 gram 后去重。
     words = re.findall(r'[a-zA-Z0-9_]{3,}', fact)
+    words += re.findall(r'[\u4e00-\u9fff]{2,4}', fact)
+    words = list(dict.fromkeys(words))  # 去重保序
     if not words:
         return []
     
@@ -2129,65 +2250,66 @@ def store_finding(project: str, fact: str, confidence: str, source: str,
     if len(fact) > MAX_FACT_LENGTH:
         raise ValueError(f"Fact too long ({len(fact)} chars). Max is {MAX_FACT_LENGTH}")
 
-    conn = _get_conn(project)
-
-    # ── 写库 gate（INSERT 前，v1.1 §1.3）──
-    try:
-        _validate_write_gate(conn, confidence, type_, based_on, source, fact,
-                             task_budget=task_budget, evidence=evidence)
-    except ValueError:
-        conn.close()
-        raise
-
-    kid = str(uuid.uuid4())
-    now = _now()
+    # json.dumps 预序列化（开连接前，P0 审查修复）：tags 不可序列化抛 TypeError 时不占连接
     tags_json = json.dumps(tags or [], ensure_ascii=False)
 
-    # 处理 tree_path：自动创建树节点
-    tree_node_id = None
-    if tree_path:
-        tree_node_id = _ensure_tree_path(conn, project, tree_path)
+    conn = _get_conn(project)
+    try:
+        # ── 写库 gate（INSERT 前，v1.1 §1.3）──
+        _validate_write_gate(conn, confidence, type_, based_on, source, fact,
+                             task_budget=task_budget, evidence=evidence)
 
-    # 非 claim 类型若 based_on 引用不存在条目，静默置空（兼容旧行为；
-    # claim 的 based_on 已由 gate 保证存在且为 observation 类型）
-    if based_on and type_ != "claim":
-        exists = conn.execute("SELECT 1 FROM knowledge WHERE id = ?", (based_on,)).fetchone()
-        if not exists:
-            based_on = None
+        kid = str(uuid.uuid4())
+        now = _now()
 
-    conn.execute("""
-        INSERT INTO knowledge (id, project, fact, confidence, source, evidence,
-                               based_on, tags, tree_node_id, type, evidence_uri,
-                               created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (kid, project, fact, confidence, source, evidence, based_on, tags_json,
-          tree_node_id, type_, evidence_uri, now, now))
+        # 处理 tree_path：自动创建树节点
+        tree_node_id = None
+        if tree_path:
+            tree_node_id = _ensure_tree_path(conn, project, tree_path)
 
-    # type=task：同步写入 task_meta（budget 三字段 + agent + dependencies_json，hypothesis_id 可空）
-    if type_ == "task":
+        # 非 claim 类型若 based_on 引用不存在条目，静默置空（兼容旧行为；
+        # claim 的 based_on 已由 gate 保证存在且为 observation 类型）
+        if based_on and type_ != "claim":
+            exists = conn.execute("SELECT 1 FROM knowledge WHERE id = ?", (based_on,)).fetchone()
+            if not exists:
+                based_on = None
+
         conn.execute("""
-            INSERT INTO task_meta (finding_id, agent, budget_tool_calls,
-                                   budget_tokens, budget_seconds, dependencies_json)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (kid, task_agent, task_budget["budget_tool_calls"],
-              task_budget["budget_tokens"], task_budget["budget_seconds"],
-              json.dumps(task_dependencies or [], ensure_ascii=False)))
+            INSERT INTO knowledge (id, project, fact, confidence, source, evidence,
+                                   based_on, tags, tree_node_id, type, evidence_uri,
+                                   created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (kid, project, fact, confidence, source, evidence, based_on, tags_json,
+              tree_node_id, type_, evidence_uri, now, now))
 
-    conn.commit()
+        # type=task：同步写入 task_meta（budget 三字段 + agent + dependencies_json，hypothesis_id 可空）
+        if type_ == "task":
+            conn.execute("""
+                INSERT INTO task_meta (finding_id, agent, budget_tool_calls,
+                                       budget_tokens, budget_seconds, dependencies_json)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (kid, task_agent, task_budget["budget_tool_calls"],
+                  task_budget["budget_tokens"], task_budget["budget_seconds"],
+                  json.dumps(task_dependencies or [], ensure_ascii=False)))
 
-    # 冲突检测
-    conflicts = _check_conflicts(conn, project, fact, exclude_id=kid) \
-        if confidence in _CONFLICT_CHECK_CONFIDENCE else []
+        conn.commit()
 
-    # 获取完整记录
-    row = conn.execute("SELECT * FROM knowledge WHERE id = ?", (kid,)).fetchone()
-    result = _row_to_dict(row)
+        # 冲突检测
+        conflicts = _check_conflicts(conn, project, fact, exclude_id=kid) \
+            if confidence in _CONFLICT_CHECK_CONFIDENCE else []
 
-    if conflicts:
-        result["_conflicts"] = conflicts
+        # 获取完整记录
+        row = conn.execute("SELECT * FROM knowledge WHERE id = ?", (kid,)).fetchone()
+        result = _row_to_dict(row)
 
-    conn.close()
-    return result
+        if conflicts:
+            result["_conflicts"] = conflicts
+
+        return result
+    finally:
+        # P0 审查修复：所有路径关闭连接（gate 拒绝/_ensure_tree_path ValueError/
+        # INSERT 异常/正常返回），原实现只有 gate 拒绝路径 close
+        conn.close()
 
 
 def search_findings(project: str, query: str = "", confidence: str | None = None,
@@ -2283,89 +2405,84 @@ def update_finding(project: str, kid: str, fact: str | None = None,
     """
     conn = _get_conn(project)
 
-    existing = conn.execute("SELECT * FROM knowledge WHERE id = ?", (kid,)).fetchone()
-    if not existing:
-        conn.close()
-        raise ValueError(f"Finding not found: {kid}")
+    try:
+        existing = conn.execute("SELECT * FROM knowledge WHERE id = ?", (kid,)).fetchone()
+        if not existing:
+            raise ValueError(f"Finding not found: {kid}")
 
-    # ── 写库 gate（update 版，v1.1 §1.3）：只校验角色权责（标 confirmed-inferred/speculative 时）
-    #    仅当调用方显式传入 confidence 且目标级别受限时才触发——只改 evidence/tags 不触发，
-    #    避免误拒父 Agent 已批准的 confirmed-inferred 条目补证据。
-    #    若改为 confirmed-inferred，还需 evidence 双 agent 交叉验证标记 ──
-    new_confidence = confidence if confidence is not None else existing["confidence"]
-    new_evidence = evidence if evidence is not None else existing["evidence"]
-    if confidence is not None and confidence in _ROLE_GATED_CONFIDENCE:
-        try:
+        # ── 写库 gate（update 版，v1.1 §1.3）：只校验角色权责（标 confirmed-inferred/speculative 时）
+        #    仅当调用方显式传入 confidence 且目标级别受限时才触发——只改 evidence/tags 不触发，
+        #    避免误拒父 Agent 已批准的 confirmed-inferred 条目补证据。
+        #    若改为 confirmed-inferred，还需 evidence 双 agent 交叉验证标记 ──
+        new_confidence = confidence if confidence is not None else existing["confidence"]
+        new_evidence = evidence if evidence is not None else existing["evidence"]
+        if confidence is not None and confidence in _ROLE_GATED_CONFIDENCE:
             _check_role_authority(source, new_confidence)
             if new_confidence == "confirmed-inferred":
                 _check_cross_validation(new_evidence)
-        except ValueError:
-            conn.close()
-            raise
 
-    updates = []
-    params = []
+        updates = []
+        params = []
 
-    if fact is not None:
-        if len(fact) > MAX_FACT_LENGTH:
-            conn.close()
-            raise ValueError(f"Fact too long ({len(fact)} chars)")
-        updates.append("fact = ?")
-        params.append(fact)
-    if confidence is not None:
-        if confidence not in VALID_CONFIDENCE:
-            conn.close()
-            raise ValueError(f"Invalid confidence: {confidence}")
-        updates.append("confidence = ?")
-        params.append(confidence)
-    if evidence is not None:
-        updates.append("evidence = ?")
-        params.append(evidence)
-    if evidence_uri is not None:
-        updates.append("evidence_uri = ?")
-        params.append(evidence_uri)
-    if tags is not None:
-        updates.append("tags = ?")
-        params.append(json.dumps(tags, ensure_ascii=False))
-    if tree_path is not None:
-        tree_node_id = _ensure_tree_path(conn, project, tree_path)
-        updates.append("tree_node_id = ?")
-        params.append(tree_node_id)
+        if fact is not None:
+            if len(fact) > MAX_FACT_LENGTH:
+                raise ValueError(f"Fact too long ({len(fact)} chars)")
+            updates.append("fact = ?")
+            params.append(fact)
+        if confidence is not None:
+            if confidence not in VALID_CONFIDENCE:
+                raise ValueError(f"Invalid confidence: {confidence}")
+            updates.append("confidence = ?")
+            params.append(confidence)
+        if evidence is not None:
+            updates.append("evidence = ?")
+            params.append(evidence)
+        if evidence_uri is not None:
+            updates.append("evidence_uri = ?")
+            params.append(evidence_uri)
+        if tags is not None:
+            updates.append("tags = ?")
+            params.append(json.dumps(tags, ensure_ascii=False))
+        if tree_path is not None:
+            tree_node_id = _ensure_tree_path(conn, project, tree_path)
+            updates.append("tree_node_id = ?")
+            params.append(tree_node_id)
 
-    if not updates:
+        if not updates:
+            return _row_to_dict(existing)
+
+        updates.append("updated_at = ?")
+        params.append(_now())
+        params.append(kid)
+
+        conn.execute(f"UPDATE knowledge SET {', '.join(updates)} WHERE id = ?", params)
+        conn.commit()
+
+        # 如果标为 disproved，级联降级依赖者
+        if confidence == "disproved" and existing["confidence"] != "disproved":
+            _cascade_invalidate(conn, kid)
+
+        # 冲突检测
+        new_fact = fact if fact is not None else existing["fact"]
+        conflicts = _check_conflicts(conn, project, new_fact, exclude_id=kid) \
+            if new_confidence in _CONFLICT_CHECK_CONFIDENCE else []
+
+        # 获取更新后记录
+        row = conn.execute("SELECT * FROM knowledge WHERE id = ?", (kid,)).fetchone()
+        result = _row_to_dict(row)
+
+        # 依赖计数
+        dep_count = conn.execute("SELECT COUNT(*) as cnt FROM knowledge WHERE based_on = ?", (kid,)).fetchone()
+        result["dependent_count"] = dep_count["cnt"]
+
+        if conflicts:
+            result["_conflicts"] = conflicts
+
+        return result
+    finally:
+        # P0 审查修复：所有路径关闭连接（原实现存在多处 conn.close() + raise / 提前 return 的重复代码，
+        # _ensure_tree_path ValueError / json.dumps TypeError 路径会泄漏连接）
         conn.close()
-        return _row_to_dict(existing)
-
-    updates.append("updated_at = ?")
-    params.append(_now())
-    params.append(kid)
-
-    conn.execute(f"UPDATE knowledge SET {', '.join(updates)} WHERE id = ?", params)
-    conn.commit()
-
-    # 如果标为 disproved，级联降级依赖者
-    if confidence == "disproved" and existing["confidence"] != "disproved":
-        _cascade_invalidate(conn, kid)
-
-    # 冲突检测
-    new_fact = fact if fact is not None else existing["fact"]
-    new_confidence = confidence if confidence is not None else existing["confidence"]
-    conflicts = _check_conflicts(conn, project, new_fact, exclude_id=kid) \
-        if new_confidence in _CONFLICT_CHECK_CONFIDENCE else []
-    
-    # 获取更新后记录
-    row = conn.execute("SELECT * FROM knowledge WHERE id = ?", (kid,)).fetchone()
-    result = _row_to_dict(row)
-    
-    # 依赖计数
-    dep_count = conn.execute("SELECT COUNT(*) as cnt FROM knowledge WHERE based_on = ?", (kid,)).fetchone()
-    result["dependent_count"] = dep_count["cnt"]
-    
-    if conflicts:
-        result["_conflicts"] = conflicts
-    
-    conn.close()
-    return result
 
 
 # ─── MCP Server ────────────────────────────────────────────────────
