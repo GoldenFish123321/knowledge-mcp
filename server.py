@@ -2116,7 +2116,8 @@ def store_finding(project: str, fact: str, confidence: str, source: str,
                   type_: str = "claim",
                   task_budget: dict | None = None,
                   task_dependencies: list | None = None,
-                  task_agent: str | None = None) -> dict:
+                  task_agent: str | None = None,
+                  evidence_uri: str | None = None) -> dict:
     """存储一条发现。tree_path 可选，自动创建关联的树节点。
 
     v1.1 写库 gate：INSERT 前做四层结构校验（角色权责 / type 校验 /
@@ -2156,10 +2157,11 @@ def store_finding(project: str, fact: str, confidence: str, source: str,
 
     conn.execute("""
         INSERT INTO knowledge (id, project, fact, confidence, source, evidence,
-                               based_on, tags, tree_node_id, type, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                               based_on, tags, tree_node_id, type, evidence_uri,
+                               created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (kid, project, fact, confidence, source, evidence, based_on, tags_json,
-          tree_node_id, type_, now, now))
+          tree_node_id, type_, evidence_uri, now, now))
 
     # type=task：同步写入 task_meta（budget 三字段 + agent + dependencies_json，hypothesis_id 可空）
     if type_ == "task":
@@ -2272,7 +2274,8 @@ def update_finding(project: str, kid: str, fact: str | None = None,
                    confidence: str | None = None, evidence: str | None = None,
                    tags: list[str] | None = None,
                    tree_path: str | None = None,
-                   source: str | None = None) -> dict:
+                   source: str | None = None,
+                   evidence_uri: str | None = None) -> dict:
     """更新发现条目。标 disproved 时触发级联降级。tree_path 可选，关联到树节点。
 
     v1.1 写库 gate（update 版）：只校验角色权责 + confirmed-inferred 交叉验证标记——
@@ -2318,6 +2321,9 @@ def update_finding(project: str, kid: str, fact: str | None = None,
     if evidence is not None:
         updates.append("evidence = ?")
         params.append(evidence)
+    if evidence_uri is not None:
+        updates.append("evidence_uri = ?")
+        params.append(evidence_uri)
     if tags is not None:
         updates.append("tags = ?")
         params.append(json.dumps(tags, ensure_ascii=False))
@@ -2391,7 +2397,8 @@ async def list_tools() -> list[Tool]:
   evidence    — 证据摘要（工具输出/反汇编片段/用户原话，≤500字符推荐）
   based_on    — 推理来源的 finding ID，用于追溯推理链
   tags        — 标签列表（如 ['crypto','rc4']）
-  tree_path   — 树状结构路径，如 'challenge.exe>sub_4012a0'（> 分隔层级），自动创建路径上所有缺失节点""",
+  tree_path   — 树状结构路径，如 'challenge.exe>sub_4012a0'（> 分隔层级），自动创建路径上所有缺失节点
+  evidence_uri — artifact:// URI（如 'artifact://tool_output/PROJ/3fa2b1c9.txt'），指向原始工具输出，配合 artifact_store 使用""",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -2403,6 +2410,7 @@ async def list_tools() -> list[Tool]:
                     "based_on": {"type": "string", "description": "推理来源 finding ID"},
                     "tags": {"type": "array", "items": {"type": "string"}, "description": "标签列表"},
                     "tree_path": {"type": "string", "description": "树状结构路径，如 'challenge.exe>sub_4012a0'"},
+                    "evidence_uri": {"type": "string", "description": "artifact:// URI，指向原始工具输出（配合 artifact_store 使用）"},
                 },
                 "required": ["project", "fact", "confidence", "source"],
             },
@@ -2481,7 +2489,8 @@ async def list_tools() -> list[Tool]:
   confidence — 新的置信度（可选）
   evidence   — 新的证据（可选）
   tags       — 新的标签列表（可选，完整替换）
-  tree_path  — 树路径，如 'challenge.exe>sub_4012a0'（⚠️ 一般不用，仅用户要求时使用）""",
+  tree_path  — 树路径，如 'challenge.exe>sub_4012a0'（⚠️ 一般不用，仅用户要求时使用）
+  evidence_uri — 新的 artifact:// URI（可选，指向原始工具输出）""",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -2492,6 +2501,7 @@ async def list_tools() -> list[Tool]:
                     "evidence": {"type": "string"},
                     "tags": {"type": "array", "items": {"type": "string"}},
                     "tree_path": {"type": "string", "description": "树路径，如 'challenge.exe>sub_4012a0'（⚠️ 一般不用）"},
+                    "evidence_uri": {"type": "string", "description": "新的 artifact:// URI（可选）"},
                 },
                 "required": ["project", "id"],
             },
@@ -3227,6 +3237,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 task_budget=arguments.get("task_budget"),
                 task_dependencies=arguments.get("task_dependencies"),
                 task_agent=arguments.get("task_agent"),
+                evidence_uri=arguments.get("evidence_uri"),
             )
             return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
 
@@ -3261,6 +3272,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 tags=arguments.get("tags"),
                 tree_path=arguments.get("tree_path"),
                 source=arguments.get("source"),
+                evidence_uri=arguments.get("evidence_uri"),
             )
             return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
 
