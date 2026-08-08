@@ -20,6 +20,7 @@ import os
 import sys
 import json
 import uuid
+import hashlib
 import sqlite3
 import asyncio
 from pathlib import Path
@@ -408,6 +409,16 @@ def _ensure_tree_path(conn: sqlite3.Connection, project: str,
     return parent_id
 
 
+def _tree_node_to_dict(row: sqlite3.Row) -> dict:
+    """树节点行转 dict：markers_json 解析为 markers 列表并移除原字段。
+
+    与 tree_mark/tree_unmark 的返回约定一致（规格 §A2：tree_get/tree_store 返回值含 markers）。
+    """
+    d = _row_to_dict(row)
+    d["markers"] = json.loads(d.pop("markers_json", None) or "[]")
+    return d
+
+
 def tree_store(project: str, path: str, node_type: str = "function",
                parent_path: str | None = None) -> dict:
     """创建或更新树节点。
@@ -437,7 +448,7 @@ def tree_store(project: str, path: str, node_type: str = "function",
     row = conn.execute(
         "SELECT * FROM tree_nodes WHERE id = ?", (node_id,)
     ).fetchone()
-    result = _row_to_dict(row)
+    result = _tree_node_to_dict(row)
 
     conn.close()
     return result
@@ -455,14 +466,14 @@ def tree_get(project: str, node_id: str) -> dict | None:
         conn.close()
         return None
 
-    result = _row_to_dict(row)
+    result = _tree_node_to_dict(row)
 
     # 子节点
     children = conn.execute(
         "SELECT * FROM tree_nodes WHERE parent_id = ? ORDER BY sort_order, name",
         (node_id,)
     ).fetchall()
-    result["children"] = [_row_to_dict(r) for r in children]
+    result["children"] = [_tree_node_to_dict(r) for r in children]
 
     # 直接挂载的 findings
     findings = conn.execute(
@@ -1701,6 +1712,200 @@ def verification_report(project: str, results: list[dict]) -> dict:
     return result
 
 
+# ─── 快照裁剪 + 项目总览 + artifact 存储（v1.1 §3.7/§3.8，gap-plan F2/F4 + G2）──
+
+_SNAPSHOT_ROLES = {"discovery", "detector", "judge", "analyst"}
+_ARTIFACT_MAX_BYTES = 512 * 1024
+_ARTIFACT_URI_PREFIX = "artifact://tool_output/"
+
+
+def findings_snapshot(project: str, role: str = "discovery",
+                      tree_node_id: str | None = None, limit: int = 50) -> dict:
+    """按角色裁剪的 findings 快照（v1.1 §3.7 / gap-plan F2）。
+
+    角色裁剪规则（信息共享协议，防锚定 + 按需给全）：
+      discovery（默认） — 仅 id + fact（≤60 字符截断）+ confidence + type，不带 evidence/source
+      detector         — 完整字段（fact/evidence/source/tags/confidence/type/tree_node_id）
+      judge            — 完整字段 + evidence_uri（若存在，指向原始工具输出）
+      analyst          — 完整字段 + based_on 展开（引用 finding 的 fact 内联为 based_on_fact）
+
+    - 非法 role → ValueError；项目无 finding → 空 snapshot
+    - truncated 按 limit 是否达上限判断（查 limit+1 条）
+    """
+    if role not in _SNAPSHOT_ROLES:
+        raise ValueError(f"Invalid role: {role}. Must be one of {sorted(_SNAPSHOT_ROLES)}")
+    conn = _get_conn(project)
+    try:
+        conditions = ["project = ?"]
+        params = [project]
+        if tree_node_id:
+            conditions.append("tree_node_id = ?")
+            params.append(tree_node_id)
+        where = " AND ".join(conditions)
+        rows = conn.execute(
+            f"SELECT * FROM knowledge WHERE {where} ORDER BY created_at DESC LIMIT ?",
+            params + [limit + 1]
+        ).fetchall()
+        truncated = len(rows) > limit
+        if truncated:
+            rows = rows[:limit]
+        snapshot = []
+        for r in rows:
+            d = _row_to_dict(r)
+            if role == "discovery":
+                snapshot.append({
+                    "id": d["id"],
+                    "fact": _truncate(d["fact"], 60),
+                    "confidence": d["confidence"],
+                    "type": d["type"],
+                })
+                continue
+            item = {
+                "id": d["id"],
+                "fact": d["fact"],
+                "confidence": d["confidence"],
+                "type": d["type"],
+                "source": d["source"],
+                "evidence": d.get("evidence", ""),
+                "tags": json.loads(d.get("tags") or "[]"),
+                "tree_node_id": d.get("tree_node_id"),
+            }
+            if role == "judge":
+                if d.get("evidence_uri"):
+                    item["evidence_uri"] = d["evidence_uri"]
+            elif role == "analyst":
+                if d.get("based_on"):
+                    item["based_on"] = d["based_on"]
+                    base = conn.execute(
+                        "SELECT fact FROM knowledge WHERE id = ?", (d["based_on"],)
+                    ).fetchone()
+                    if base:
+                        item["based_on_fact"] = _truncate(base["fact"], 120)
+            snapshot.append(item)
+        return {"role": role, "truncated": truncated, "snapshot": snapshot}
+    finally:
+        conn.close()
+
+
+def project_list() -> list[dict]:
+    """项目总览（v1.1 §3.7 / gap-plan F4）：遍历 DB_DIR 下 *.db 返回统计，按 updated_at 倒序。
+
+    - project 名从文件名去 .db 后缀；-wal/-shm 文件跳过
+    - updated_at = knowledge.updated_at / tree_nodes.created_at（tree_nodes 无 updated_at 列，
+      用其唯一时间戳 created_at 代理）两表 MAX 的较大者；无数据时取文件 mtime
+    - 数据库损坏（无法查询/无表）→ try/except 跳过该文件
+    """
+    projects = []
+    for db_file in sorted(DB_DIR.glob("*.db")):
+        if db_file.name.endswith(("-wal.db", "-shm.db")):
+            continue
+        project = db_file.name[:-3]
+        try:
+            conn = sqlite3.connect(str(db_file))
+            try:
+                conn.row_factory = sqlite3.Row
+                findings_count = conn.execute("SELECT count(*) FROM knowledge").fetchone()[0]
+                tree_nodes_count = conn.execute("SELECT count(*) FROM tree_nodes").fetchone()[0]
+                row = conn.execute(
+                    "SELECT MAX(u) AS u FROM ("
+                    "  SELECT MAX(updated_at) AS u FROM knowledge"
+                    "  UNION ALL"
+                    "  SELECT MAX(created_at) AS u FROM tree_nodes"
+                    ")"
+                ).fetchone()
+                updated_at = row["u"] if row and row["u"] else None
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            continue
+        if updated_at is None:
+            updated_at = datetime.fromtimestamp(
+                db_file.stat().st_mtime, tz=timezone.utc
+            ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        projects.append({
+            "project": project,
+            "findings_count": findings_count,
+            "tree_nodes_count": tree_nodes_count,
+            "updated_at": updated_at,
+        })
+    projects.sort(key=lambda p: (p["updated_at"], p["project"]), reverse=True)
+    return projects
+
+
+def artifact_store(project: str, tool: str, command: str, output: str) -> dict:
+    """原始工具输出落盘（v1.1 §3.8 / gap-plan G2）。
+
+    写入 DB_DIR/artifacts/<project>/<sha1>.txt（sha1 = 输出 SHA1 前 16 位），
+    返回 artifact:// URI 供 findings_store 的 evidence_uri 引用。
+    文件格式：头 3 行元数据（# tool: / # command: / # stored_at:）+ 空行 + 输出正文。
+    输出超 512KB 截断并标记 truncated。
+    """
+    _get_db_path(project)  # 校验项目名合法
+    if project in (".", ".."):
+        raise ValueError(f"Invalid project name: {project}")
+    output = output or ""
+    data = output.encode("utf-8")
+    truncated = False
+    if len(data) > _ARTIFACT_MAX_BYTES:
+        data = data[:_ARTIFACT_MAX_BYTES]
+        output = data.decode("utf-8", errors="ignore")
+        truncated = True
+    sha1 = hashlib.sha1(output.encode("utf-8")).hexdigest()[:16]
+    art_dir = DB_DIR / "artifacts" / project
+    art_dir.mkdir(parents=True, exist_ok=True)
+    file_path = art_dir / f"{sha1}.txt"
+    # 头 3 行元数据（# tool: / # command: / # stored_at:），output 从第 4 行起（规格 §3.8）
+    header = f"# tool: {tool}\n# command: {command}\n# stored_at: {_now()}\n"
+    file_path.write_text(header + output, encoding="utf-8")
+    result = {
+        "uri": f"{_ARTIFACT_URI_PREFIX}{project}/{sha1}.txt",
+        "bytes": len(data),
+    }
+    if truncated:
+        result["truncated"] = True
+    return result
+
+
+def artifact_get(uri: str) -> dict:
+    """取回原始输出（v1.1 §3.8，裁决型用）：解析 artifact:// URI 读文件头元数据 + 正文。
+
+    - URI 非法（格式/项目名/文件名不符合）或文件不存在 → ValueError
+    - 返回 {"uri", "tool", "command", "output", "stored_at"}
+    """
+    import re
+    if not uri:
+        raise ValueError("Invalid artifact uri: empty")
+    m = re.match(
+        r"^artifact://tool_output/(?P<project>[\w\-\.]+)/(?P<file>[0-9a-f]{16}\.txt)$",
+        uri,
+    )
+    if not m:
+        raise ValueError(f"Invalid artifact uri: {uri}")
+    project, fname = m.group("project"), m.group("file")
+    # 防路径穿越：project 段只允许普通名字，不允许 "." / ".."（正则已排除 "/"）
+    if project in (".", "..") or not re.match(r"^[\w\-\.]+$", project):
+        raise ValueError(f"Invalid artifact uri: {uri}")
+    file_path = DB_DIR / "artifacts" / project / fname
+    if not file_path.exists():
+        raise ValueError(f"Artifact not found: {uri}")
+    text = file_path.read_text(encoding="utf-8")
+    lines = text.split("\n")
+    # 前 3 行元数据（# key: value），其后（第 4 行起）为输出正文
+    meta = {}
+    for i in range(3):
+        if i < len(lines) and lines[i].startswith("# "):
+            key, _, val = lines[i][2:].partition(": ")
+            meta[key.strip()] = val.strip()
+    output = "\n".join(lines[3:]) if len(lines) > 3 else ""
+    return {
+        "uri": uri,
+        "tool": meta.get("tool", ""),
+        "command": meta.get("command", ""),
+        "stored_at": meta.get("stored_at", ""),
+        "output": output,
+    }
+
+
 # ─── 核心逻辑 ──────────────────────────────────────────────────────
 
 def _cascade_invalidate(conn: sqlite3.Connection, parent_id: str):
@@ -1985,40 +2190,59 @@ def store_finding(project: str, fact: str, confidence: str, source: str,
 
 def search_findings(project: str, query: str = "", confidence: str | None = None,
                     tag: str | None = None, tree_node_id: str | None = None,
-                    limit: int = 20) -> list[dict]:
-    """搜索发现。tree_node_id 可选，过滤特定树节点下的 findings。"""
+                    limit: int = 20, use_fts: bool = False) -> list[dict]:
+    """搜索发现。tree_node_id 可选，过滤特定树节点下的 findings。
+
+    use_fts=True 且 query 非空 → 走 knowledge_fts MATCH（query 按空白拆词 AND 连接），
+    从 knowledge 表按 rowid 回查完整记录；MATCH 语法异常时回退 LIKE。
+    use_fts=True 且 query 为空 → 回退 LIKE 逻辑（FTS 无 query 无意义）。
+    """
     conn = _get_conn(project)
 
-    conditions = ["project = ?"]
+    conditions = ["k.project = ?"]
     params = [project]
+    fts = bool(use_fts) and bool(query)
 
-    if query:
-        conditions.append("(fact LIKE ? OR evidence LIKE ?)")
+    if not fts and query:
+        conditions.append("(k.fact LIKE ? OR k.evidence LIKE ?)")
         params.extend([f"%{query}%", f"%{query}%"])
     if confidence:
         if confidence == "verified":
             conditions.append(
-                "confidence IN ('confirmed-observed', 'confirmed-inferred', 'disproved')"
+                "k.confidence IN ('confirmed-observed', 'confirmed-inferred', 'disproved')"
             )
         elif confidence == "confirmed":
             conditions.append(
-                "confidence IN ('confirmed-observed', 'confirmed-inferred')"
+                "k.confidence IN ('confirmed-observed', 'confirmed-inferred')"
             )
         else:
-            conditions.append("confidence = ?")
+            conditions.append("k.confidence = ?")
             params.append(confidence)
     if tag:
-        conditions.append("tags LIKE ?")
+        conditions.append("k.tags LIKE ?")
         params.append(f"%{tag}%")
     if tree_node_id:
-        conditions.append("tree_node_id = ?")
+        conditions.append("k.tree_node_id = ?")
         params.append(tree_node_id)
 
     where = " AND ".join(conditions)
-    sql = f"SELECT * FROM knowledge WHERE {where} ORDER BY created_at DESC LIMIT ?"
-    params.append(limit)
-
-    rows = conn.execute(sql, params).fetchall()
+    rows = []
+    if fts:
+        # 拆词 AND：query 空白分词后每个词加引号（短语匹配），双引号转义
+        terms = [t.replace('"', '""') for t in query.split() if t.strip()]
+        match_expr = " AND ".join(f'"{t}"' for t in terms)
+        sql = (
+            "SELECT k.* FROM knowledge_fts f JOIN knowledge k ON k.rowid = f.rowid "
+            f"WHERE knowledge_fts MATCH ? AND {where} "
+            "ORDER BY k.created_at DESC LIMIT ?"
+        )
+        try:
+            rows = conn.execute(sql, [match_expr] + params + [limit]).fetchall()
+        except sqlite3.OperationalError:
+            fts = False  # MATCH 表达式异常（非常规 token）→ 回退 LIKE
+    if not fts:
+        sql = f"SELECT k.* FROM knowledge k WHERE {where} ORDER BY k.created_at DESC LIMIT ?"
+        rows = conn.execute(sql, params + [limit]).fetchall()
     results = [_row_to_dict(r) for r in rows]
     conn.close()
     return results
@@ -2196,6 +2420,7 @@ async def list_tools() -> list[Tool]:
   - tree_node_id 过滤特定树节点下的 findings
   - 多条件 AND 逻辑
   - 按创建时间倒序
+  - use_fts=true 时走 FTS5 全文索引（query 按空白拆词 AND 匹配；query 为空时回退 LIKE）
 
 参数:
   project       — 项目名
@@ -2203,7 +2428,8 @@ async def list_tools() -> list[Tool]:
   confidence    — 置信度过滤
   tag           — 标签过滤
   tree_node_id  — 树节点 ID，过滤该节点下的所有 findings
-  limit         — 返回上限（默认20）""",
+  limit         — 返回上限（默认20）
+  use_fts       — 是否使用 FTS5 全文索引（默认 false）""",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -2213,6 +2439,7 @@ async def list_tools() -> list[Tool]:
                     "tag": {"type": "string", "description": "标签过滤"},
                     "tree_node_id": {"type": "string", "description": "树节点 ID"},
                     "limit": {"type": "integer", "default": 20, "minimum": 1, "maximum": 100},
+                    "use_fts": {"type": "boolean", "default": False, "description": "使用 FTS5 全文索引"},
                 },
                 "required": ["project"],
             },
@@ -2895,6 +3122,91 @@ verified=false → 仅记录到返回的 mismatches（不自动生成 conflict�
                 "required": ["project", "results"],
             },
         ),
+        Tool(
+            name="findings_snapshot",
+            description="""按角色裁剪的 findings 快照（v1.1 §3.7 / gap-plan F2）。
+
+角色裁剪规则（信息共享协议）:
+  discovery（默认） — 仅 id + fact（≤60 字符）+ confidence + type，不带 evidence/source（防锚定）
+  detector         — 完整字段（fact/evidence/source/tags/confidence/type/tree_node_id）
+  judge            — 完整字段 + evidence_uri（若存在，指向原始工具输出）
+  analyst          — 完整字段 + based_on 展开（引用 finding 的 fact 内联为 based_on_fact）
+
+返回 {role, truncated, snapshot}；truncated 表示已达 limit 上限被截断；非法 role 拒绝。
+
+参数:
+  project       — 项目名
+  role          — 裁剪角色（默认 discovery）
+  tree_node_id  — 只取该树节点下的 findings（可选）
+  limit         — 返回上限（默认50）""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "项目名"},
+                    "role": {
+                        "type": "string",
+                        "enum": sorted(_SNAPSHOT_ROLES),
+                        "default": "discovery",
+                        "description": "裁剪角色",
+                    },
+                    "tree_node_id": {"type": "string", "description": "树节点 ID 过滤"},
+                    "limit": {"type": "integer", "default": 50, "minimum": 1, "maximum": 500},
+                },
+                "required": ["project"],
+            },
+        ),
+        Tool(
+            name="project_list",
+            description="""项目总览（v1.1 §3.7 / gap-plan F4）：列出 DB_DIR 下所有项目及其统计。
+
+返回 [{project, findings_count, tree_nodes_count, updated_at}]，按 updated_at 倒序。
+无需参数。""",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        ),
+        Tool(
+            name="artifact_store",
+            description="""原始工具输出落盘（v1.1 §3.8 / gap-plan G2）。
+
+写入 DB_DIR/artifacts/<project>/<sha1>.txt（sha1 = 输出 SHA1 前 16 位），
+返回 artifact:// URI 供 findings_store 的 evidence_uri 引用。
+输出超 512KB 自动截断并标记 truncated。
+
+参数:
+  project — 项目名
+  tool    — 工具名（如 gdb / ida）
+  command — 实际执行的命令
+  output  — 原始工具输出""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "项目名"},
+                    "tool": {"type": "string", "description": "工具名"},
+                    "command": {"type": "string", "description": "执行的命令"},
+                    "output": {"type": "string", "description": "原始工具输出"},
+                },
+                "required": ["project", "tool", "command", "output"],
+            },
+        ),
+        Tool(
+            name="artifact_get",
+            description="""取回原始输出（v1.1 §3.8，裁决型用）：按 artifact:// URI 读取文件。
+
+返回 {uri, tool, command, output, stored_at}；URI 非法或文件不存在拒绝。
+
+参数:
+  uri — artifact://tool_output/<project>/<sha1>.txt""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "uri": {"type": "string", "description": "artifact URI"},
+                },
+                "required": ["uri"],
+            },
+        ),
     ]
 
 
@@ -2926,6 +3238,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 tag=arguments.get("tag"),
                 tree_node_id=arguments.get("tree_node_id"),
                 limit=arguments.get("limit", 20),
+                use_fts=arguments.get("use_fts", False),
             )
             return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
 
@@ -3163,6 +3476,32 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 project=arguments["project"],
                 results=arguments.get("results", []),
             )
+            return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+
+        elif name == "findings_snapshot":
+            result = findings_snapshot(
+                project=arguments["project"],
+                role=arguments.get("role", "discovery"),
+                tree_node_id=arguments.get("tree_node_id"),
+                limit=arguments.get("limit", 50),
+            )
+            return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+
+        elif name == "project_list":
+            result = project_list()
+            return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+
+        elif name == "artifact_store":
+            result = artifact_store(
+                project=arguments["project"],
+                tool=arguments["tool"],
+                command=arguments["command"],
+                output=arguments["output"],
+            )
+            return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+
+        elif name == "artifact_get":
+            result = artifact_get(uri=arguments["uri"])
             return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
 
         else:
