@@ -1428,6 +1428,279 @@ def preflight_check(project: str) -> dict:
     }
 
 
+# ─── 冲突存储 + 回归原语（v1.1 §3.5/§3.8，gap-plan C1 + G3）：conflict 状态机 + verification 抽样 ──
+
+# 冲突类型：1数值|2因果|3前提|4指令|5原始数据（类型清单是检测型子 Agent 的 prompt 内容，
+# 服务端只做字段合法性校验，不判断语义）
+CONFLICT_TYPES = (1, 2, 3, 4, 5)
+CONFLICT_STATUSES = ("pending", "under_review", "adjudicated", "resolved_by_rerun")
+CONFLICT_STRATEGIES = ("rerun_tool", "cross_tool", "dynamic_trace", "judge", "debate", "human")
+
+
+def _next_conflict_id(conn: sqlite3.Connection, project: str) -> str:
+    """按 project 内 C-XXXX 递增（查 max +1）；id 是全局主键，撞号时顺延。"""
+    import re
+    max_n = 0
+    for row in conn.execute(
+        "SELECT id FROM conflicts WHERE project = ?", (project,)
+    ).fetchall():
+        m = re.fullmatch(r"C-(\d+)", row["id"] or "")
+        if m:
+            max_n = max(max_n, int(m.group(1)))
+    while True:
+        max_n += 1
+        cand = f"C-{max_n:04d}"
+        if not conn.execute("SELECT 1 FROM conflicts WHERE id = ?", (cand,)).fetchone():
+            return cand
+
+
+def conflict_report(project: str, conflict_type: int,
+                    party_a_id: str, party_a_summary: str, party_a_evidence: str,
+                    party_b_id: str, party_b_summary: str, party_b_evidence: str,
+                    reporter: str, tree_node_id: str | None = None) -> dict:
+    """检测型子 Agent 上报冲突（v1.1 §3.5 / gap-plan C1）：只落库，不判断"谁对谁错"。
+
+    - conflict_type 硬校验 1-5（存储合法性，不判断语义）；reporter 非空
+    - tree_node_id 可选：传入时给该树节点加 'conflict' 标记（复用 tree_mark 逻辑）
+    - 服务端不提供"哪方对"的输入槽——从 schema 上杜绝倾向性（检测型只报冲突、不裁决）
+    """
+    if conflict_type not in CONFLICT_TYPES:
+        raise ValueError(
+            f"Invalid conflict_type: {conflict_type!r}. Must be one of {list(CONFLICT_TYPES)}"
+        )
+    if not reporter or not str(reporter).strip():
+        raise ValueError("reporter must not be empty")
+
+    # tree_node_id 传入 → 先加 conflict 标记（节点不存在会 ValueError，标记失败则冲突不落库）
+    if tree_node_id is not None:
+        tree_mark(project, tree_node_id, "conflict")
+
+    conn = _get_conn(project)
+    try:
+        cid = _next_conflict_id(conn, project)
+        created_at = _now()
+        conn.execute(
+            "INSERT INTO conflicts (id, project, conflict_type, party_a_id, party_a_summary, "
+            "party_a_evidence, party_b_id, party_b_summary, party_b_evidence, reporter, "
+            "status, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+            (cid, project, conflict_type, party_a_id, party_a_summary, party_a_evidence,
+             party_b_id, party_b_summary, party_b_evidence, reporter, created_at, created_at),
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM conflicts WHERE id = ?", (cid,)).fetchone()
+        result = _row_to_dict(row)
+    finally:
+        conn.close()
+    return result
+
+
+def conflict_list(project: str, status: str | None = None, limit: int = 50) -> list[dict]:
+    """冲突队列（C1，v1.1 §3.5）：created_at 升序（最旧优先），status 精确过滤。"""
+    if status is not None and status not in CONFLICT_STATUSES:
+        raise ValueError(f"Invalid status: {status!r}. Must be one of {list(CONFLICT_STATUSES)}")
+    conn = _get_conn(project)
+    try:
+        if status is None:
+            rows = conn.execute(
+                "SELECT * FROM conflicts WHERE project = ? "
+                "ORDER BY created_at, id LIMIT ?",
+                (project, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM conflicts WHERE project = ? AND status = ? "
+                "ORDER BY created_at, id LIMIT ?",
+                (project, status, limit),
+            ).fetchall()
+    finally:
+        conn.close()
+    return [_row_to_dict(r) for r in rows]
+
+
+def conflict_update(project: str, id: str, status: str | None = None,
+                    strategy: str | None = None, resolution: str | None = None) -> dict:
+    """裁决型子 Agent 定案记录（C1，v1.1 §3.5）：状态机推进 + 结论记录。
+
+    - status ∈ {pending, under_review, adjudicated, resolved_by_rerun}（不强制顺序，允许跳转）
+    - 终态 adjudicated/resolved_by_rerun 必须填 strategy（六策略）+ resolution，否则 ValueError
+    - 进入终态且 resolved_at 为空 → 自动补 _now()（已记过不覆盖）
+    - resolution 含 "disproved" → 联动：party_a_id 若为 knowledge 条目则标 disproved
+      （触发级联降级；try/except 包裹避免级联异常中断）
+    - "谁对谁错"由裁决型子 Agent 判断，工具只记录结论
+    """
+    if status is not None and status not in CONFLICT_STATUSES:
+        raise ValueError(f"Invalid status: {status!r}. Must be one of {list(CONFLICT_STATUSES)}")
+    if strategy is not None and strategy not in CONFLICT_STRATEGIES:
+        raise ValueError(
+            f"Invalid strategy: {strategy!r}. Must be one of {list(CONFLICT_STRATEGIES)}"
+        )
+    if status in ("adjudicated", "resolved_by_rerun"):
+        if strategy is None:
+            raise ValueError(
+                f"status={status} requires a strategy "
+                f"(one of {list(CONFLICT_STRATEGIES)})"
+            )
+        if not resolution or not str(resolution).strip():
+            raise ValueError(f"status={status} requires a non-empty resolution")
+
+    conn = _get_conn(project)
+    try:
+        existing = conn.execute(
+            "SELECT * FROM conflicts WHERE id = ? AND project = ?", (id, project)
+        ).fetchone()
+        if not existing:
+            raise ValueError(f"Conflict not found: {id}")
+        updates, params = [], []
+        if status is not None:
+            updates.append("status = ?")
+            params.append(status)
+        if strategy is not None:
+            updates.append("strategy = ?")
+            params.append(strategy)
+        if resolution is not None:
+            updates.append("resolution = ?")
+            params.append(resolution)
+        new_status = status if status is not None else existing["status"]
+        new_resolution = resolution if resolution is not None else existing["resolution"]
+        # 终态且 resolved_at 为空 → 自动补（已 resolve 再 update 不覆盖时间）
+        if new_status in ("adjudicated", "resolved_by_rerun") and existing["resolved_at"] is None:
+            updates.append("resolved_at = ?")
+            params.append(_now())
+        updates.append("updated_at = ?")
+        params.append(_now())
+        params.append(id)
+        conn.execute(f"UPDATE conflicts SET {', '.join(updates)} WHERE id = ?", params)
+        conn.commit()
+        row = conn.execute("SELECT * FROM conflicts WHERE id = ?", (id,)).fetchone()
+        result = _row_to_dict(row)
+        party_a_id = existing["party_a_id"]
+    finally:
+        conn.close()
+
+    # 联动：resolution 含 "disproved" → party_a 被否定，标 knowledge 条目为 disproved
+    # （update_finding 触发级联降级）。party_a_id 非 knowledge 条目（如 observation:xxx）
+    # 或已不存在 → 静默跳过；异常不中断裁决记录。
+    if "disproved" in (new_resolution or ""):
+        try:
+            update_finding(project, kid=party_a_id, confidence="disproved")
+        except Exception:
+            pass
+    return result
+
+
+def conflict_stats(project: str) -> dict:
+    """冲突统计（C1，v1.1 §3.5）：按状态计数 + 按类型计数（by_type 用 str key 与规格示例一致）。"""
+    conn = _get_conn(project)
+    try:
+        counts = {s: 0 for s in CONFLICT_STATUSES}
+        for row in conn.execute(
+            "SELECT status, COUNT(*) AS cnt FROM conflicts WHERE project = ? GROUP BY status",
+            (project,),
+        ).fetchall():
+            counts[row["status"]] = row["cnt"]
+        by_type = {}
+        for row in conn.execute(
+            "SELECT conflict_type, COUNT(*) AS cnt FROM conflicts "
+            "WHERE project = ? GROUP BY conflict_type",
+            (project,),
+        ).fetchall():
+            by_type[str(row["conflict_type"])] = row["cnt"]
+    finally:
+        conn.close()
+    return {**counts, "by_type": by_type}
+
+
+def _tool_command_hint(source: str | None) -> str:
+    """从 source 提取 tool:xxx → '重跑: xxx'（多个 tool 去重逗号连接），无则 ''。"""
+    import re
+    if not source:
+        return ""
+    tools = []
+    for m in re.finditer(r"tool:([A-Za-z0-9_.\-]+)", source, flags=re.I):
+        if m.group(1) not in tools:
+            tools.append(m.group(1))
+    return "重跑: " + ", ".join(tools) if tools else ""
+
+
+def verification_check(project: str, sample_size: int = 3,
+                       confidence: str = "confirmed-observed") -> dict:
+    """回归抽样原语（G3，v1.1 §3.8）：随机取 N 条指定置信度 findings 交发现型子 Agent 重跑对照。
+
+    - ORDER BY RANDOM() LIMIT n；sample_size 上限 20（超限截断），≤0 拒绝
+    - command_hint 从 source 提取 tool:xxx → '重跑: xxx'（无则 ""）
+    - 项目无数据 → 空 sample（不报错）
+    """
+    if sample_size is None:
+        sample_size = 3
+    try:
+        sample_size = int(sample_size)
+    except (TypeError, ValueError):
+        raise ValueError(f"Invalid sample_size: {sample_size!r}")
+    if sample_size <= 0:
+        raise ValueError(f"sample_size must be positive, got {sample_size}")
+    n = min(sample_size, 20)
+    conn = _get_conn(project)
+    try:
+        rows = conn.execute(
+            "SELECT id, fact, source, evidence_uri FROM knowledge "
+            "WHERE project = ? AND confidence = ? ORDER BY RANDOM() LIMIT ?",
+            (project, confidence, n),
+        ).fetchall()
+    finally:
+        conn.close()
+    sample = [
+        {
+            "finding_id": r["id"],
+            "fact": r["fact"],
+            "source": r["source"],
+            "evidence_uri": r["evidence_uri"],
+            "command_hint": _tool_command_hint(r["source"]),
+        }
+        for r in rows
+    ]
+    return {"sample": sample}
+
+
+def verification_report(project: str, results: list[dict]) -> dict:
+    """回归回写存储（G3，v1.1 §3.8）：verified=true → 追加 regression_verified 标签（去重）；false → 仅记录。
+
+    - 不一致时不自动生成 conflict——由发现型子 Agent 走 conflict_report(conflict_type=5) 上报
+    - verified=true 但 finding 不存在 → 跳过并记入 skipped（不中断整批），返回附加字段
+    """
+    verified_n, mismatch_n, tagged, mismatches, skipped = 0, 0, [], [], []
+    for item in results or []:
+        finding_id = item.get("finding_id")
+        verified = bool(item.get("verified"))
+        actual_output = item.get("actual_output", "")
+        if verified:
+            try:
+                row = get_finding(project, finding_id)
+                if row is None:
+                    skipped.append({"finding_id": finding_id})
+                    continue
+                tags = json.loads(row.get("tags") or "[]")
+                if "regression_verified" not in tags:
+                    tags.append("regression_verified")
+                update_finding(project, kid=finding_id, tags=tags)
+                tagged.append(finding_id)
+                verified_n += 1
+            except Exception:
+                skipped.append({"finding_id": finding_id})
+        else:
+            mismatches.append({"finding_id": finding_id, "actual_output": actual_output})
+            mismatch_n += 1
+    result = {
+        "verified": verified_n,
+        "mismatch": mismatch_n,
+        "tagged": tagged,
+        "mismatches": mismatches,
+    }
+    if skipped:
+        result["skipped"] = skipped
+    return result
+
+
 # ─── 核心逻辑 ──────────────────────────────────────────────────────
 
 def _cascade_invalidate(conn: sqlite3.Connection, parent_id: str):
@@ -2471,6 +2744,157 @@ repeat_count+1；≥2 时返回 freeze_hint=true 与强制停止提示
                 "required": ["project"],
             },
         ),
+        Tool(
+            name="conflict_report",
+            description="""检测型子 Agent 上报冲突（v1.1 §3.5 / gap-plan C1）：落库 + 关联树节点加 conflict 标记。
+
+服务端只做字段合法性校验（conflict_type 1-5、reporter 非空），不判断"谁对谁错"；
+识别与裁决分别归检测型/裁决型子 Agent。可选 tree_node_id 传入时给该节点加 conflict 标记。
+
+参数:
+  project          — 项目名
+  conflict_type    — 1数值|2因果|3前提|4指令|5原始数据
+  party_a_id       — A 方 finding ID（或 observation:<id>）
+  party_a_summary  — A 方结论摘要
+  party_a_evidence — A 方证据（原始输出引用/摘录）
+  party_b_id       — B 方 finding ID（或 observation:<id>）
+  party_b_summary  — B 方结论摘要
+  party_b_evidence — B 方证据
+  reporter         — 上报者 agent-id（如 detector-2）
+  tree_node_id     — 可选：关联树节点，自动加 conflict 标记""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "项目名"},
+                    "conflict_type": {"type": "integer", "enum": list(CONFLICT_TYPES), "description": "1数值|2因果|3前提|4指令|5原始数据"},
+                    "party_a_id": {"type": "string", "description": "A 方 finding ID"},
+                    "party_a_summary": {"type": "string", "description": "A 方结论摘要"},
+                    "party_a_evidence": {"type": "string", "description": "A 方证据"},
+                    "party_b_id": {"type": "string", "description": "B 方 finding ID"},
+                    "party_b_summary": {"type": "string", "description": "B 方结论摘要"},
+                    "party_b_evidence": {"type": "string", "description": "B 方证据"},
+                    "reporter": {"type": "string", "description": "上报者 agent-id"},
+                    "tree_node_id": {"type": "string", "description": "可选：关联树节点"},
+                },
+                "required": ["project", "conflict_type", "party_a_id", "party_a_summary",
+                             "party_a_evidence", "party_b_id", "party_b_summary",
+                             "party_b_evidence", "reporter"],
+            },
+        ),
+        Tool(
+            name="conflict_list",
+            description="""冲突队列（v1.1 §3.5 / gap-plan C1）：created_at 升序（最旧优先），status 精确过滤。
+
+参数:
+  project — 项目名
+  status  — 状态过滤（可选）：pending|under_review|adjudicated|resolved_by_rerun
+  limit   — 返回上限（默认50）""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "项目名"},
+                    "status": {"type": "string", "enum": list(CONFLICT_STATUSES), "description": "状态过滤"},
+                    "limit": {"type": "integer", "default": 50, "minimum": 1, "maximum": 200},
+                },
+                "required": ["project"],
+            },
+        ),
+        Tool(
+            name="conflict_update",
+            description="""裁决型子 Agent 定案记录（v1.1 §3.5 / gap-plan C1）：状态机推进 + 结论记录。
+
+状态推进 pending→under_review→adjudicated / resolved_by_rerun（允许跳转）；
+进入终态（adjudicated/resolved_by_rerun）必须填 strategy + resolution，自动记 resolved_at。
+resolution 含 "disproved" → 自动联动：party_a 条目标 disproved（触发级联降级）。
+"谁对谁错"由裁决型子 Agent 判断，工具只记录结论。
+
+参数:
+  project    — 项目名
+  id         — 冲突 ID（如 C-0001）
+  status     — 新状态（可选）
+  strategy   — 解决策略（终态必填）：rerun_tool|cross_tool|dynamic_trace|judge|debate|human
+  resolution — 裁决结论 + 支撑证据引用（终态必填）""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "项目名"},
+                    "id": {"type": "string", "description": "冲突 ID（如 C-0001）"},
+                    "status": {"type": "string", "enum": list(CONFLICT_STATUSES), "description": "新状态"},
+                    "strategy": {"type": "string", "enum": list(CONFLICT_STRATEGIES), "description": "解决策略"},
+                    "resolution": {"type": "string", "description": "裁决结论 + 支撑证据引用"},
+                },
+                "required": ["project", "id"],
+            },
+        ),
+        Tool(
+            name="conflict_stats",
+            description="""冲突统计（v1.1 §3.5 / gap-plan C1）：按状态计数 + 按类型计数。
+
+返回 {pending, under_review, adjudicated, resolved_by_rerun, by_type: {type: N}}。
+
+参数:
+  project — 项目名""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "项目名"},
+                },
+                "required": ["project"],
+            },
+        ),
+        Tool(
+            name="verification_check",
+            description="""回归抽样原语（v1.1 §3.8 / gap-plan G3）：随机取 N 条指定置信度 findings，交发现型子 Agent 重跑对照。
+
+ORDER BY RANDOM() 抽样；sample_size 上限 20（超限截断）；项目无数据返回空 sample。
+command_hint 从 source 提取 tool:xxx → "重跑: xxx"（无则 ""）。
+
+参数:
+  project     — 项目名
+  sample_size — 抽样条数（默认3，上限20）
+  confidence  — 置信度过滤（默认 confirmed-observed）""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "项目名"},
+                    "sample_size": {"type": "integer", "default": 3, "minimum": 1, "maximum": 20, "description": "抽样条数"},
+                    "confidence": {"type": "string", "description": "置信度过滤"},
+                },
+                "required": ["project"],
+            },
+        ),
+        Tool(
+            name="verification_report",
+            description="""回归回写存储（v1.1 §3.8 / gap-plan G3）：发现型子 Agent 重跑工具后的对照结果存回。
+
+verified=true → 该 finding 追加 'regression_verified' 标签（去重）；
+verified=false → 仅记录到返回的 mismatches（不自动生成 conflict——
+由发现型子 Agent 走 conflict_report(conflict_type=5) 正常上报路径）。
+
+参数:
+  project — 项目名
+  results — [{finding_id, verified: bool, actual_output: str}]""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "项目名"},
+                    "results": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "finding_id": {"type": "string", "description": "finding ID"},
+                                "verified": {"type": "boolean", "description": "重跑对照是否一致"},
+                                "actual_output": {"type": "string", "description": "实际工具输出"},
+                            },
+                            "required": ["finding_id", "verified"],
+                        },
+                        "description": "重跑对照结果列表",
+                    },
+                },
+                "required": ["project", "results"],
+            },
+        ),
     ]
 
 
@@ -2687,6 +3111,58 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
         elif name == "preflight_check":
             result = preflight_check(project=arguments["project"])
+            return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+
+        elif name == "conflict_report":
+            result = conflict_report(
+                project=arguments["project"],
+                conflict_type=arguments["conflict_type"],
+                party_a_id=arguments["party_a_id"],
+                party_a_summary=arguments["party_a_summary"],
+                party_a_evidence=arguments["party_a_evidence"],
+                party_b_id=arguments["party_b_id"],
+                party_b_summary=arguments["party_b_summary"],
+                party_b_evidence=arguments["party_b_evidence"],
+                reporter=arguments["reporter"],
+                tree_node_id=arguments.get("tree_node_id"),
+            )
+            return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+
+        elif name == "conflict_list":
+            result = conflict_list(
+                project=arguments["project"],
+                status=arguments.get("status"),
+                limit=arguments.get("limit", 50),
+            )
+            return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+
+        elif name == "conflict_update":
+            result = conflict_update(
+                project=arguments["project"],
+                id=arguments["id"],
+                status=arguments.get("status"),
+                strategy=arguments.get("strategy"),
+                resolution=arguments.get("resolution"),
+            )
+            return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+
+        elif name == "conflict_stats":
+            result = conflict_stats(project=arguments["project"])
+            return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+
+        elif name == "verification_check":
+            result = verification_check(
+                project=arguments["project"],
+                sample_size=arguments.get("sample_size", 3),
+                confidence=arguments.get("confidence", "confirmed-observed"),
+            )
+            return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+
+        elif name == "verification_report":
+            result = verification_report(
+                project=arguments["project"],
+                results=arguments.get("results", []),
+            )
             return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
 
         else:
