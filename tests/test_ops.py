@@ -214,11 +214,12 @@ class TestConflict(harness.HarnessTestCase):
         node = self.mod.tree_get(self.p, f"{self.p}>node_a")
         self.assertIn("conflict", node["markers"], "report 时给节点加 conflict 标记")
 
-    def test_report_marker_failure_not_stored(self):
-        with self.assertRaises(ValueError):
-            self._report(node="no-such-node")
-        self.assertEqual(len(self.mod.conflict_list(self.p)), 0,
-                         "标记失败则冲突不落库")
+    def test_report_marker_failure_still_stored(self):
+        # P1b 修复 8：先落库再标记——节点不存在时冲突仍落库，返回 warning（不再 ValueError + 不落库）
+        c = self._report(node="no-such-node")
+        self.assertEqual(len(self.mod.conflict_list(self.p)), 1,
+                         "标记失败冲突仍落库（先落库后标记）")
+        self.assertIn("warning", c, "标记失败返回 warning 提示")
 
     def test_update_terminal_requires_strategy_resolution(self):
         self._report()

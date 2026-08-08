@@ -18,6 +18,7 @@ Findings MCP Server — 轻量级 Agent 推理发现存储，带可信度标注�
 
 import os
 import sys
+import re
 import json
 import uuid
 import hashlib
@@ -49,6 +50,12 @@ VALID_NODE_TYPES = {"project", "file", "function", "class", "section"}
 # 树节点路径分隔符
 TREE_SEP = ">"
 
+# P1b 审查修复：项目名校验统一常量（_get_db_path / artifact_get 共用同一收紧正则）。
+# 收紧动机：原 ^[\\w\\-\\.]+$ 中 \\w 在 Python3 匹配 CJK，且允许 . / .. / .hidden 点号开头
+# → project="." 生成 "..db"、project=".." 生成 "...db" 污染 DB_DIR、CJK 项目名绕过校验。
+# 新规则：首字符必须字母数字（禁点号开头 → 整体不可能为 . / .. / .hidden），禁 CJK。
+_PROJECT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+
 # 需要冲突检测的置信度——所有"已确认/已证伪"的级别
 _CONFLICT_CHECK_CONFIDENCE = {"confirmed-observed", "confirmed-inferred", "disproved"}
 
@@ -66,9 +73,13 @@ _ROLE_GATED_CONFIDENCE = {"confirmed-inferred", "speculative"}
 # ─── SQLite 数据层 ────────────────────────────────────────────────
 
 def _get_db_path(project: str) -> Path:
-    """返回项目数据库文件路径。非法项目名抛出 ValueError。"""
-    import re
-    if not re.match(r'^[\w\-\.]+$', project):
+    """返回项目数据库文件路径。非法项目名抛出 ValueError。
+
+    P1b 审查修复：统一走 _PROJECT_NAME_RE 收紧校验（首字符字母数字、禁点号开头、
+    禁 CJK）——原 ^[\\w\\-\\.]+$ 中 \\w 匹配中文、放行 . / .. / .hidden，
+    会生成 ..db / ...db 污染 DB_DIR。
+    """
+    if not project or not _PROJECT_NAME_RE.match(project):
         raise ValueError(f"Invalid project name: {project}")
     return DB_DIR / f"{project}.db"
 
@@ -815,16 +826,23 @@ def freeze_trigger(project: str, reason: str) -> dict:
 
     返回当前冻结状态（freeze_status 输出），并附 frozen_at 字段
     （规格 §3.6 响应格式 {"frozen": true, "frozen_at": "..."}）。
+    P1b 审查修复：reason 空/空白 → ValueError（原实现写入 frozen="" 产生
+    reason=["显式冻结: "] 的空原因冻结）。
     """
+    if not reason or not str(reason).strip():
+        raise ValueError("reason must not be empty")
     conn = _get_conn(project)
     try:
         now = _now()
+        # P1b 审查修复：写 situations 必须 bump version（统一"任何写操作 bump"语义）。
+        # INSERT 分支显式 version=2（与 situation_update 首次写入 1→2 约定一致）；
+        # UPDATE 分支 version = situations.version + 1（不依赖 excluded.version）
         conn.execute(
-            "INSERT INTO situations (project, frozen, frozen_at, updated_at) "
-            "VALUES (?, ?, ?, ?) "
+            "INSERT INTO situations (project, frozen, frozen_at, updated_at, version) "
+            "VALUES (?, ?, ?, ?, 2) "
             "ON CONFLICT(project) DO UPDATE SET "
             "frozen = excluded.frozen, frozen_at = excluded.frozen_at, "
-            "updated_at = excluded.updated_at",
+            "updated_at = excluded.updated_at, version = situations.version + 1",
             (project, reason, now, now),
         )
         conn.commit()
@@ -852,11 +870,13 @@ def freeze_release(project: str) -> dict:
     返回当前冻结状态（freeze_status 输出）；解除成功时附 released_at
     （规格 §3.6 响应格式 {"frozen": false, "released_at": "..."}）。
     注意：自动触发的冻结（违规/待办/重复指令）由对应计数变化决定，本工具只清显式标记。
+    P1b 审查修复：解除冻结也是写操作 → version+1（仅当确实有行被更新）。
     """
     conn = _get_conn(project)
     try:
         conn.execute(
-            "UPDATE situations SET frozen = NULL, frozen_at = NULL, updated_at = ? "
+            "UPDATE situations SET frozen = NULL, frozen_at = NULL, "
+            "updated_at = ?, version = version + 1 "
             "WHERE project = ?",
             (_now(), project),
         )
@@ -954,7 +974,12 @@ def situation_update(project: str, objective: str | None = None,
     - version 每次 +1；表无行时先 INSERT 新行（objective 默认 ''），有行时 UPDATE
     - 校验：candidate_directions 每项必须含 evidence_strength ∈ {high,mid,low}，缺失拒绝；
       progress 每项 id 若引用不存在的 finding → 降级为纯文本摘要（去掉 id，gap-plan A1）
+    - P1b 审查修复：无任何有效字段（全部 None）→ 返回原状、不建行、不 bump version
+      （原实现空参数调用也 version+1，与 freeze_trigger 的写操作语义不一致）
     """
+    if all(v is None for v in (objective, progress, active_work,
+                               candidate_directions, risks, timeline_event)):
+        return situation_get(project)
     conn = _get_conn(project)
     try:
         row = conn.execute(
@@ -1251,9 +1276,22 @@ def tree_render(project: str, node_id: str | None = None,
                     _render_node(item, sub, depth + 1, child_prefix, last)
 
         _emit(root["name"])
-        kids = _children_of(root["id"])
-        for i, k in enumerate(kids):
-            _render_node(k, [i + 1], 1, "", i == len(kids) - 1)
+        # P1b 审查修复：根节点挂载的 findings 也要渲染（原实现只渲染 children，
+        # _findings_of(root) 从未被调用）。复用节点渲染规则：findings 编号 1,2,…
+        # 排在 children 前，与子节点共享编号序列（与非根节点行为一致）。
+        virtual = []
+        if with_findings:
+            virtual += [("f", x) for x in _findings_of(root["id"])]
+        virtual += [("n", x) for x in _children_of(root["id"])]
+        for i, (kind, item) in enumerate(virtual):
+            last = i == len(virtual) - 1
+            sub = [i + 1]
+            if kind == "f":
+                b = "└── " if last else "├── "
+                if not _emit(f"{b}{_finding_line(item, str(i + 1))}"):
+                    break
+            else:
+                _render_node(item, sub, 1, "", last)
 
         text = "\n".join(out)
         if truncated:
@@ -1466,9 +1504,11 @@ def directive_update(project: str, id: str, status: str | None = None,
 
 
 def directive_repeat(project: str, id: str) -> dict:
-    """用户重复同一指令（B1 规则3）：repeat_count+1；≥2 时返回冻结提示（不实际冻结）。
+    """用户重复同一指令（B1 规则3）。
 
-    冻结判断归 freeze_status（FREEZE_REPEAT_THRESHOLD=2）。
+    - 未解决指令：repeat_count+1；≥2 时返回冻结提示（不实际冻结，判断归 freeze_status）
+    - 已解决指令（resolved）：重复 = 用户对处理结果不满意 → 新建一条相同文本的新指令
+      （新 id、status=received、repeat_count=0），原指令保持不变（v1.1 §4 ⑧）
     """
     conn = _get_conn(project)
     try:
@@ -1477,6 +1517,36 @@ def directive_repeat(project: str, id: str) -> dict:
         ).fetchone()
         if row is None:
             raise ValueError(f"directive not found: {id}")
+        if row["status"] == "resolved":
+            # 已解决 → 新建（复用 directive_create 的 D-XXXX 分配逻辑）
+            created_at = _now()
+            new_id = None
+            for _attempt in range(10):
+                try:
+                    new_id = _next_directive_id(conn, project)
+                    conn.execute(
+                        "INSERT INTO directives (id, project, text, anchor, type, status, repeat_count, created_at) "
+                        "VALUES (?, ?, ?, ?, ?, 'received', 0, ?)",
+                        (new_id, project, row["text"], row["anchor"], row["type"], created_at),
+                    )
+                    conn.commit()
+                    break
+                except sqlite3.IntegrityError:
+                    conn.rollback()
+                except sqlite3.OperationalError as _e:
+                    conn.rollback()
+                    if "locked" not in str(_e).lower():
+                        raise
+                    import time as _time
+                    _time.sleep(0.05 * (_attempt + 1))
+            else:
+                raise RuntimeError(
+                    f"directive id 分配并发冲突 10 次仍失败（project={project}）"
+                )
+            return {
+                "new_id": new_id, "reason": "原指令已解决，重复视为新指令",
+                "original_id": id, "status": "received", "repeat_count": 0,
+            }
         repeat_count = row["repeat_count"] + 1
         conn.execute(
             "UPDATE directives SET repeat_count = ? WHERE project = ? AND id = ?",
@@ -1576,6 +1646,9 @@ def conflict_report(project: str, conflict_type: int,
     - conflict_type 硬校验 1-5（存储合法性，不判断语义）；reporter 非空
     - tree_node_id 可选：传入时给该树节点加 'conflict' 标记（复用 tree_mark 逻辑）
     - 服务端不提供"哪方对"的输入槽——从 schema 上杜绝倾向性（检测型只报冲突、不裁决）
+    - P1b 审查修复：先落库 conflict（INSERT 成功）再 tree_mark——原顺序"先标记后落库"
+      在 INSERT 失败时留下孤儿标记（节点标 conflict 但冲突未落库）；现标记失败
+      （节点不存在）不影响落库结果，返回 warning 提示
     """
     if conflict_type not in CONFLICT_TYPES:
         raise ValueError(
@@ -1583,10 +1656,6 @@ def conflict_report(project: str, conflict_type: int,
         )
     if not reporter or not str(reporter).strip():
         raise ValueError("reporter must not be empty")
-
-    # tree_node_id 传入 → 先加 conflict 标记（节点不存在会 ValueError，标记失败则冲突不落库）
-    if tree_node_id is not None:
-        tree_mark(project, tree_node_id, "conflict")
 
     conn = _get_conn(project)
     try:
@@ -1623,6 +1692,14 @@ def conflict_report(project: str, conflict_type: int,
         result = _row_to_dict(row)
     finally:
         conn.close()
+
+    # P1b 审查修复：落库成功后再加树标记（INSERT 失败路径根本到不了这里 → 无孤儿标记）；
+    # 节点不存在 → 标记失败不影响落库结果，返回 warning（信息只增不减）
+    if tree_node_id is not None:
+        try:
+            tree_mark(project, tree_node_id, "conflict")
+        except ValueError as e:
+            result["warning"] = f"conflict {cid} 已落库但树节点标记失败: {e}"
     return result
 
 
@@ -1804,37 +1881,49 @@ def verification_report(project: str, results: list[dict]) -> dict:
 
     - 不一致时不自动生成 conflict——由发现型子 Agent 走 conflict_report(conflict_type=5) 上报
     - verified=true 但 finding 不存在 → 跳过并记入 skipped（不中断整批），返回附加字段
+    - P1b 审查修复：verified 必须是严格布尔 True/False——原 bool(item.get("verified"))
+      把字符串 "false" 当真值，回归验签结果反转；非布尔/缺失 → 计入 invalid 并跳过
     """
-    verified_n, mismatch_n, tagged, mismatches, skipped = 0, 0, [], [], []
+    verified_n, mismatch_n, invalid_n = 0, 0, 0
+    tagged, mismatches, skipped, invalid_items = [], [], [], []
     for item in results or []:
         finding_id = item.get("finding_id")
-        verified = bool(item.get("verified"))
+        verified_val = item.get("verified")
         actual_output = item.get("actual_output", "")
-        if verified:
-            try:
-                row = get_finding(project, finding_id)
-                if row is None:
-                    skipped.append({"finding_id": finding_id})
-                    continue
-                tags = json.loads(row.get("tags") or "[]")
-                if "regression_verified" not in tags:
-                    tags.append("regression_verified")
-                update_finding(project, kid=finding_id, tags=tags)
-                tagged.append(finding_id)
-                verified_n += 1
-            except Exception:
+        # 严格布尔判定：只有 True 才算验证通过；False 算 mismatch；
+        # 其余（"false"/"true"/None/1 等）一律 invalid 跳过——不猜测调用方意图
+        if verified_val is not True:
+            if verified_val is False:
+                mismatches.append({"finding_id": finding_id, "actual_output": actual_output})
+                mismatch_n += 1
+            else:
+                invalid_items.append({"finding_id": finding_id, "verified": verified_val})
+                invalid_n += 1
+            continue
+        try:
+            row = get_finding(project, finding_id)
+            if row is None:
                 skipped.append({"finding_id": finding_id})
-        else:
-            mismatches.append({"finding_id": finding_id, "actual_output": actual_output})
-            mismatch_n += 1
+                continue
+            tags = json.loads(row.get("tags") or "[]")
+            if "regression_verified" not in tags:
+                tags.append("regression_verified")
+            update_finding(project, kid=finding_id, tags=tags)
+            tagged.append(finding_id)
+            verified_n += 1
+        except Exception:
+            skipped.append({"finding_id": finding_id})
     result = {
         "verified": verified_n,
         "mismatch": mismatch_n,
+        "invalid": invalid_n,
         "tagged": tagged,
         "mismatches": mismatches,
     }
     if skipped:
         result["skipped"] = skipped
+    if invalid_items:
+        result["invalid_items"] = invalid_items
     return result
 
 
@@ -1843,6 +1932,21 @@ def verification_report(project: str, results: list[dict]) -> dict:
 _SNAPSHOT_ROLES = {"discovery", "detector", "judge", "analyst"}
 _ARTIFACT_MAX_BYTES = 512 * 1024
 _ARTIFACT_URI_PREFIX = "artifact://tool_output/"
+# P1b 审查修复：artifact 文件头元数据键白名单（读取侧连续解析只认这三个键，
+# 以 # 开头的正文——如反汇编注释 "# 0x4012a0: ..."——不会被误吞为元数据）
+_ARTIFACT_META_KEYS = ("tool", "command", "stored_at")
+
+
+def _sanitize_artifact_meta(value) -> str:
+    """P1b 审查修复：artifact 元数据值（tool/command）写入前消毒。
+
+    把 \r\n / \r 折叠为空格——Path.read_text 的通用换行模式会把 \r 翻译成 \n，
+    导致读写不对称（存 "a\rb" 读回 "a\nb"，凭空多出一行破坏文件头结构）。
+    \n 故意不折叠：\n 注入防御由 artifact_get 的连续解析器承担（可无损恢复原值）。
+    """
+    if value is None:
+        return ""
+    return re.sub(r"\r\n|\r", " ", str(value))
 
 
 def findings_snapshot(project: str, role: str = "discovery",
@@ -1963,12 +2067,16 @@ def artifact_store(project: str, tool: str, command: str, output: str) -> dict:
 
     写入 DB_DIR/artifacts/<project>/<sha1>.txt（sha1 = 输出 SHA1 前 16 位），
     返回 artifact:// URI 供 findings_store 的 evidence_uri 引用。
-    文件格式：头 3 行元数据（# tool: / # command: / # stored_at:）+ 空行 + 输出正文。
+    文件格式：头 3 行元数据（# tool: / # command: / # stored_at:）+ 输出正文。
     输出超 512KB 截断并标记 truncated。
+    P1b 审查修复：tool/command 写入前做 \r 消毒（\r\n / \r → 空格，防通用换行读取
+    翻译产生伪换行）；\n 保持原样——注入防御归读取侧连续解析器（_sanitize_artifact_meta
+    与 artifact_get 配套，保证 tool="gdb\n# command: injected" 读回 tool=gdb、
+    output 不错位）。
     """
-    _get_db_path(project)  # 校验项目名合法
-    if project in (".", ".."):
-        raise ValueError(f"Invalid project name: {project}")
+    _get_db_path(project)  # 校验项目名合法（P1b 收紧正则，. / .. / .hidden / CJK 全拒）
+    tool = _sanitize_artifact_meta(tool)
+    command = _sanitize_artifact_meta(command)
     output = output or ""
     data = output.encode("utf-8")
     truncated = False
@@ -1997,32 +2105,40 @@ def artifact_get(uri: str) -> dict:
 
     - URI 非法（格式/项目名/文件名不符合）或文件不存在 → ValueError
     - 返回 {"uri", "tool", "command", "output", "stored_at"}
+    - P1b 审查修复：读取侧连续解析元数据行（# key: value 且 key ∈ {tool,command,stored_at}）
+      直到第一个非元数据行——旧格式文件里 \n 注入产生的伪元数据行会被后续真实行覆盖
+      （真实头行总是写在注入行之后），以 # 开头的正文（如反汇编注释）不会被误吞
     """
-    import re
     if not uri:
         raise ValueError("Invalid artifact uri: empty")
     m = re.match(
-        r"^artifact://tool_output/(?P<project>[\w\-\.]+)/(?P<file>[0-9a-f]{16}\.txt)$",
+        r"^artifact://tool_output/(?P<project>[A-Za-z0-9][A-Za-z0-9_.-]*)/(?P<file>[0-9a-f]{16}\.txt)$",
         uri,
     )
     if not m:
         raise ValueError(f"Invalid artifact uri: {uri}")
     project, fname = m.group("project"), m.group("file")
-    # 防路径穿越：project 段只允许普通名字，不允许 "." / ".."（正则已排除 "/"）
-    if project in (".", "..") or not re.match(r"^[\w\-\.]+$", project):
+    # P1b 审查修复：与 _get_db_path 同一收紧正则（禁 . / .. / .hidden 点号开头 / CJK），
+    # 防路径穿越 + 项目名绕过；原 ^[\\w\\-\\.]+$ 的 \\w 匹配中文放行 .hidden
+    if not _PROJECT_NAME_RE.match(project):
         raise ValueError(f"Invalid artifact uri: {uri}")
     file_path = DB_DIR / "artifacts" / project / fname
     if not file_path.exists():
         raise ValueError(f"Artifact not found: {uri}")
     text = file_path.read_text(encoding="utf-8")
     lines = text.split("\n")
-    # 前 3 行元数据（# key: value），其后（第 4 行起）为输出正文
+    # 连续解析元数据行：# key: value 且 key 在白名单内；遇到第一个非元数据行即停，
+    # 该行及其后全部视为输出正文（输出可能以 # 开头，但键不在白名单 → 不被吞）
     meta = {}
-    for i in range(3):
-        if i < len(lines) and lines[i].startswith("# "):
-            key, _, val = lines[i][2:].partition(": ")
-            meta[key.strip()] = val.strip()
-    output = "\n".join(lines[3:]) if len(lines) > 3 else ""
+    i = 0
+    while i < len(lines) and lines[i].startswith("# "):
+        body = lines[i][2:]
+        key, sep, val = body.partition(": ")
+        if not sep or key.strip() not in _ARTIFACT_META_KEYS:
+            break
+        meta[key.strip()] = val.strip()
+        i += 1
+    output = "\n".join(lines[i:]) if i < len(lines) else ""
     return {
         "uri": uri,
         "tool": meta.get("tool", ""),
@@ -2137,7 +2253,9 @@ def _parse_source_role(source: str | None) -> str | None:
     import re
     if not source:
         return None
-    m = re.search(r'role:([A-Za-z0-9_\-]+)', source)
+    # \b 边界防 "controle:parent" 之类字符串误解析；source 是约定性信任边界——
+    # role 由调用方自报，平台层应强制注入真实 role（详见 README 职责边界说明）
+    m = re.search(r'\brole:([A-Za-z0-9_\-]+)', source)
     return m.group(1).lower() if m else None
 
 
@@ -2436,6 +2554,10 @@ def update_finding(project: str, kid: str, fact: str | None = None,
     v1.1 写库 gate（update 版）：只校验角色权责 + confirmed-inferred 交叉验证标记——
     type 在 store 时已校验，update 一般只改置信度/证据，不重新做 type 校验。
     """
+    # P1b 审查修复：tags 预序列化移到 _get_conn 之前（与 store_finding 一致）——
+    # 含不可序列化对象时 json.dumps 抛 TypeError 不占用连接（原实现序列化在连接内执行）
+    tags_json = json.dumps(tags, ensure_ascii=False) if tags is not None else None
+
     conn = _get_conn(project)
 
     try:
@@ -2475,7 +2597,7 @@ def update_finding(project: str, kid: str, fact: str | None = None,
             params.append(evidence_uri)
         if tags is not None:
             updates.append("tags = ?")
-            params.append(json.dumps(tags, ensure_ascii=False))
+            params.append(tags_json)
         if tree_path is not None:
             tree_node_id = _ensure_tree_path(conn, project, tree_path)
             updates.append("tree_node_id = ?")
