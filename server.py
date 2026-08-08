@@ -66,6 +66,10 @@ def _migrate_schema(conn: sqlite3.Connection):
     检测并迁移旧版 schema。
     1. 旧版 4 级置信度 → 新版 5 级（移除 CHECK 约束）
     2. 添加 tree_node_id 列（v2 → v3 树状结构支持）
+    3. knowledge 表添加 v1.1 列：type / evidence_uri / invalidation_reason
+    4. tree_nodes 表添加 v1.1 列：status / markers_json
+    （6 张新表 + FTS5 由 _get_conn 的 CREATE TABLE IF NOT EXISTS 与 _ensure_fts_index 负责，
+      此处只做"列级增量迁移"，保证旧 DB 首连自动升级且不抛异常。）
     """
     cursor = conn.execute(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='knowledge'"
@@ -110,6 +114,24 @@ def _migrate_schema(conn: sqlite3.Connection):
         )
         conn.commit()
 
+    # ── 迁移 3：knowledge 表添加 v1.1 新列 ──
+    # SQLite 不支持 ALTER TABLE ADD COLUMN IF NOT EXISTS，需先查 pragma 判断列是否存在
+    knowledge_cols = {r[1] for r in conn.execute("PRAGMA table_info(knowledge)").fetchall()}
+    if "type" not in knowledge_cols:
+        conn.execute("ALTER TABLE knowledge ADD COLUMN type TEXT NOT NULL DEFAULT 'claim'")
+    if "evidence_uri" not in knowledge_cols:
+        conn.execute("ALTER TABLE knowledge ADD COLUMN evidence_uri TEXT")
+    if "invalidation_reason" not in knowledge_cols:
+        conn.execute("ALTER TABLE knowledge ADD COLUMN invalidation_reason TEXT")
+
+    # ── 迁移 4：tree_nodes 表添加 v1.1 新列 ──
+    tree_cols = {r[1] for r in conn.execute("PRAGMA table_info(tree_nodes)").fetchall()}
+    if "status" not in tree_cols:
+        conn.execute("ALTER TABLE tree_nodes ADD COLUMN status TEXT NOT NULL DEFAULT 'normal'")
+    if "markers_json" not in tree_cols:
+        conn.execute("ALTER TABLE tree_nodes ADD COLUMN markers_json TEXT NOT NULL DEFAULT '[]'")
+    conn.commit()
+
 
 def _get_conn(project: str) -> sqlite3.Connection:
     """获取项目数据库连接，自动建表并迁移旧 schema。"""
@@ -129,6 +151,9 @@ def _get_conn(project: str) -> sqlite3.Connection:
             based_on    TEXT,
             tags        TEXT NOT NULL DEFAULT '[]',
             tree_node_id TEXT,
+            type        TEXT NOT NULL DEFAULT 'claim',
+            evidence_uri TEXT,
+            invalidation_reason TEXT,
             created_at  TEXT NOT NULL DEFAULT (datetime('now')),
             updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
             FOREIGN KEY (based_on) REFERENCES knowledge(id) ON DELETE SET NULL
@@ -141,8 +166,81 @@ def _get_conn(project: str) -> sqlite3.Connection:
         "node_type   TEXT NOT NULL,"
         "name        TEXT NOT NULL,"
         "sort_order  INTEGER NOT NULL DEFAULT 0,"
+        "status      TEXT NOT NULL DEFAULT 'normal',"
+        "markers_json TEXT NOT NULL DEFAULT '[]',"
         "created_at  TEXT NOT NULL DEFAULT (datetime('now')),"
         "FOREIGN KEY (parent_id) REFERENCES tree_nodes(id) ON DELETE CASCADE"
+        ")")
+
+    # ── v1.1 新增表 ──
+    # situations：局面对象（状态层核心），每项目一行，version 用于 HANDOFF 版本化
+    conn.execute("CREATE TABLE IF NOT EXISTS situations ("
+        "project        TEXT PRIMARY KEY,"
+        "objective      TEXT NOT NULL DEFAULT '',"
+        "progress_json  TEXT NOT NULL DEFAULT '[]',"
+        "active_work_json TEXT NOT NULL DEFAULT '{}',"
+        "conflict_queue_json TEXT NOT NULL DEFAULT '[]',"
+        "candidate_directions_json TEXT NOT NULL DEFAULT '[]',"
+        "risks_json     TEXT NOT NULL DEFAULT '[]',"
+        "user_directives_json TEXT NOT NULL DEFAULT '[]',"
+        "timeline_json  TEXT NOT NULL DEFAULT '[]',"
+        "version        INTEGER NOT NULL DEFAULT 1,"
+        "frozen         TEXT,"
+        "frozen_at      TEXT,"
+        "updated_at     TEXT NOT NULL DEFAULT (datetime('now'))"
+        ")")
+    # directives：用户指令待办（指挥层核心），D-XXXX 递增编号
+    conn.execute("CREATE TABLE IF NOT EXISTS directives ("
+        "id          TEXT PRIMARY KEY,"
+        "project     TEXT NOT NULL,"
+        "text        TEXT NOT NULL,"
+        "anchor      TEXT,"
+        "type        TEXT NOT NULL,"
+        "status      TEXT NOT NULL DEFAULT 'received',"
+        "repeat_count INTEGER NOT NULL DEFAULT 0,"
+        "created_at  TEXT NOT NULL DEFAULT (datetime('now')),"
+        "resolved_at TEXT,"
+        "outcome     TEXT,"
+        "resolved_by TEXT"
+        ")")
+    # conflicts：冲突对象（状态机），C-XXXX 递增编号
+    conn.execute("CREATE TABLE IF NOT EXISTS conflicts ("
+        "id            TEXT PRIMARY KEY,"
+        "project       TEXT NOT NULL,"
+        "conflict_type INTEGER NOT NULL,"
+        "party_a_id    TEXT NOT NULL,"
+        "party_a_summary TEXT NOT NULL,"
+        "party_a_evidence TEXT NOT NULL,"
+        "party_b_id    TEXT NOT NULL,"
+        "party_b_summary TEXT NOT NULL,"
+        "party_b_evidence TEXT NOT NULL,"
+        "reporter      TEXT NOT NULL,"
+        "status        TEXT NOT NULL DEFAULT 'pending',"
+        "strategy      TEXT,"
+        "resolution    TEXT,"
+        "created_at    TEXT NOT NULL DEFAULT (datetime('now')),"
+        "updated_at    TEXT NOT NULL DEFAULT (datetime('now')),"
+        "resolved_at   TEXT"
+        ")")
+    # audit_log：违规审计（监督层），自增 ID
+    conn.execute("CREATE TABLE IF NOT EXISTS audit_log ("
+        "id          INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "project     TEXT NOT NULL,"
+        "actor       TEXT NOT NULL,"
+        "rule_id     TEXT NOT NULL,"
+        "detail      TEXT NOT NULL,"
+        "created_at  TEXT NOT NULL DEFAULT (datetime('now'))"
+        ")")
+    # task_meta：task 专属元数据，finding_id 关联 knowledge.id
+    conn.execute("CREATE TABLE IF NOT EXISTS task_meta ("
+        "finding_id      TEXT PRIMARY KEY,"
+        "hypothesis_id   TEXT,"
+        "agent           TEXT,"
+        "budget_tool_calls INTEGER,"
+        "budget_tokens   INTEGER,"
+        "budget_seconds  INTEGER,"
+        "task_status     TEXT NOT NULL DEFAULT 'todo',"
+        "dependencies_json TEXT NOT NULL DEFAULT '[]'"
         ")")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_project_conf ON knowledge(project, confidence)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_project_tags ON knowledge(project, tags)")
@@ -158,7 +256,73 @@ def _get_conn(project: str) -> sqlite3.Connection:
     # tree_node_id 索引在迁移之后创建（迁移会添加该列）
     conn.execute("CREATE INDEX IF NOT EXISTS idx_knowledge_tree_node ON knowledge(project, tree_node_id)")
     conn.commit()
+
+    # FTS5 全文索引（放在迁移之后：迁移 1 可能 RENAME 重建 knowledge 表，必须先完成再建 FTS）
+    _ensure_fts_index(conn)
     return conn
+
+
+def _ensure_fts_index(conn: sqlite3.Connection):
+    """
+    创建 knowledge_fts 全文索引（FTS5 外部内容表）+ 同步触发器 + 存量数据回填。
+
+    - content='knowledge' 外部内容表，索引 fact + evidence + tags 三列
+    - 分词器优先 trigram（SQLite ≥3.34，支持子串/LIKE 类匹配，适合代码/符号搜索）；
+      若当前 SQLite 编译版本不支持 trigram，回退 unicode61
+    - knowledge 主键是 TEXT id（非 WITHOUT ROWID 表），rowid 隐式存在，可作为 FTS rowid
+    - 幂等：虚拟表 IF NOT EXISTS、触发器 IF NOT EXISTS；存量回填仅在 FTS 为空时执行
+    """
+    # 建虚拟表（trigram 优先，失败回退 unicode61）
+    try:
+        conn.execute("""
+            CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_fts USING fts5(
+                fact, evidence, tags,
+                content='knowledge', content_rowid='rowid', tokenize='trigram'
+            )
+        """)
+    except sqlite3.OperationalError:
+        # 回退：老 SQLite / 未编译 trigram 时使用 unicode61
+        conn.execute("DROP TABLE IF EXISTS knowledge_fts")
+        conn.execute("""
+            CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_fts USING fts5(
+                fact, evidence, tags,
+                content='knowledge', content_rowid='rowid', tokenize='unicode61'
+            )
+        """)
+
+    # 同步触发器：INSERT / DELETE / UPDATE 三向同步
+    conn.execute("""
+        CREATE TRIGGER IF NOT EXISTS knowledge_ai AFTER INSERT ON knowledge BEGIN
+            INSERT INTO knowledge_fts(rowid, fact, evidence, tags)
+            VALUES (new.rowid, new.fact, new.evidence, new.tags);
+        END
+    """)
+    conn.execute("""
+        CREATE TRIGGER IF NOT EXISTS knowledge_ad AFTER DELETE ON knowledge BEGIN
+            INSERT INTO knowledge_fts(knowledge_fts, rowid, fact, evidence, tags)
+            VALUES ('delete', old.rowid, old.fact, old.evidence, old.tags);
+        END
+    """)
+    conn.execute("""
+        CREATE TRIGGER IF NOT EXISTS knowledge_au AFTER UPDATE ON knowledge BEGIN
+            INSERT INTO knowledge_fts(knowledge_fts, rowid, fact, evidence, tags)
+            VALUES ('delete', old.rowid, old.fact, old.evidence, old.tags);
+            INSERT INTO knowledge_fts(rowid, fact, evidence, tags)
+            VALUES (new.rowid, new.fact, new.evidence, new.tags);
+        END
+    """)
+
+    # 存量数据回填：触发器只对新写入生效，旧库已有数据需在此手动同步一次
+    # 注意：FTS5 外部内容表的 COUNT(*) 会读取 content 表（knowledge），索引为空时
+    # 也返回 content 行数，无法判断索引是否为空 —— 改用 FTS5 影子表 knowledge_fts_idx
+    # （索引分段表，空索引时为 0 行）判断是否需要回填。
+    idx_count = conn.execute("SELECT count(*) FROM knowledge_fts_idx").fetchone()[0]
+    if idx_count == 0:
+        conn.execute("""
+            INSERT INTO knowledge_fts(rowid, fact, evidence, tags)
+            SELECT rowid, fact, evidence, tags FROM knowledge
+        """)
+    conn.commit()
 
 
 def _row_to_dict(row: sqlite3.Row) -> dict:
