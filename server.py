@@ -1174,6 +1174,260 @@ def tree_render(project: str, node_id: str | None = None,
         conn.close()
 
 
+# ─── 指挥层（v1.1 §3.4/§3.7，gap-plan B1/B2/B3 + F3）：用户指令待办 + 确定性解析器 + preflight ──
+
+DIRECTIVE_TYPES = ("verify", "redirect", "stop", "question", "info")
+DIRECTIVE_STATUSES = ("received", "acknowledged", "in_progress", "resolved", "needs_clarify")
+
+# B2 确定性解析器关键词表（优先级：stop > redirect > verify > question，纯规则无 LLM）
+_DIRECTIVE_KEYWORDS = [
+    (("不要", "停止", "别再", "暂停"), "stop"),
+    (("应该", "必须", "优先", "先做"), "redirect"),
+    (("验证一下", "再查", "确认", "检查", "重跑", "翻源码", "看下", "验证"), "verify"),
+    (("为什么", "怎么回事", "什么情况", "你确定吗", "没有结果", "？", "?"), "question"),
+]
+
+
+def _extract_node_anchor(text: str) -> str | None:
+    """从指令文本提取 node X.Y 锚点（B2：引用节点号 → 默认 verify + 锚定）。"""
+    import re
+    m = re.search(r"node\s+[\d.]+", text or "")
+    return m.group(0) if m else None
+
+
+def parse_directive(text: str, anchor: str | None = None) -> dict:
+    """确定性解析用户指令（B2，纯规则无 LLM，不落库）。
+
+    优先级 stop > redirect > verify > question；引用 node X.Y → 默认 verify + 锚定；
+    都不匹配 → info（纯信息补充，不入待办）；空文本无法确定 → 兜底 redirect（宁多勿漏）。
+    返回 {"type", "anchor", "matched_keywords"}；anchor 优先用传入值，node 提取仅兜底。
+    """
+    t = (text or "").strip()
+    if not t:
+        # 兜底：无法确定 → 一律按指令入待办（type=redirect），宁多勿漏（v2 §8.2）
+        return {"type": "redirect", "anchor": anchor, "matched_keywords": []}
+
+    node_anchor = _extract_node_anchor(t)
+    for keywords, typ in _DIRECTIVE_KEYWORDS:
+        hits = [k for k in keywords if k in t]
+        if hits:
+            return {
+                "type": typ,
+                "anchor": anchor or node_anchor,
+                "matched_keywords": hits,
+            }
+    if node_anchor:
+        return {"type": "verify", "anchor": anchor or node_anchor, "matched_keywords": [node_anchor]}
+    return {"type": "info", "anchor": anchor, "matched_keywords": []}
+
+
+def _next_directive_id(conn: sqlite3.Connection, project: str) -> str:
+    """按 project 内 D-XXXX 递增（查 max +1）；id 是全局主键，撞号时顺延。"""
+    import re
+    max_n = 0
+    for row in conn.execute(
+        "SELECT id FROM directives WHERE project = ?", (project,)
+    ).fetchall():
+        m = re.fullmatch(r"D-(\d+)", row["id"] or "")
+        if m:
+            max_n = max(max_n, int(m.group(1)))
+    while True:
+        max_n += 1
+        cand = f"D-{max_n:04d}"
+        if not conn.execute("SELECT 1 FROM directives WHERE id = ?", (cand,)).fetchone():
+            return cand
+
+
+def directive_create(project: str, text: str, anchor: str | None = None,
+                     type: str | None = None) -> dict:
+    """创建用户指令待办（B1，v1.1 §3.4）。
+
+    - type 未传 → 服务端用确定性解析器推断（B2）；type=info（显式传或解析出）→ 不落库
+    - id 按 project 内 D-XXXX 递增；status='received'；anchor 传入优先，node 提取仅兜底
+    """
+    parsed = parse_directive(text, anchor=anchor)
+    resolved_type = type if type else parsed["type"]
+    if resolved_type == "info":
+        return {"skipped": True, "reason": "info 不入待办", "parsed": parsed}
+    if resolved_type not in DIRECTIVE_TYPES:
+        raise ValueError(f"invalid directive type: {resolved_type}")
+
+    conn = _get_conn(project)
+    try:
+        did = _next_directive_id(conn, project)
+        created_at = _now()
+        conn.execute(
+            "INSERT INTO directives (id, project, text, anchor, type, status, repeat_count, created_at) "
+            "VALUES (?, ?, ?, ?, ?, 'received', 0, ?)",
+            (did, project, text, parsed["anchor"], resolved_type, created_at),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return {
+        "id": did, "project": project, "text": text, "anchor": parsed["anchor"],
+        "type": resolved_type, "status": "received", "repeat_count": 0,
+        "created_at": created_at,
+    }
+
+
+def directive_list(project: str, status: str | None = None, limit: int = 50) -> list[dict]:
+    """待办清单（B1）：默认 created_at 升序（最旧优先）；status 过滤。
+
+    status 支持精确值或否定式（如 "!resolved" → status != 'resolved'，供 preflight 复用）。
+    """
+    conn = _get_conn(project)
+    try:
+        if status is None:
+            rows = conn.execute(
+                "SELECT * FROM directives WHERE project = ? "
+                "ORDER BY created_at, id LIMIT ?",
+                (project, limit),
+            ).fetchall()
+        elif status.startswith("!"):
+            neg = status[1:]
+            if neg not in DIRECTIVE_STATUSES:
+                raise ValueError(f"invalid directive status: {status}")
+            rows = conn.execute(
+                "SELECT * FROM directives WHERE project = ? AND status != ? "
+                "ORDER BY created_at, id LIMIT ?",
+                (project, neg, limit),
+            ).fetchall()
+        else:
+            if status not in DIRECTIVE_STATUSES:
+                raise ValueError(f"invalid directive status: {status}")
+            rows = conn.execute(
+                "SELECT * FROM directives WHERE project = ? AND status = ? "
+                "ORDER BY created_at, id LIMIT ?",
+                (project, status, limit),
+            ).fetchall()
+    finally:
+        conn.close()
+    return [_row_to_dict(r) for r in rows]
+
+
+def directive_update(project: str, id: str, status: str | None = None,
+                     outcome: str | None = None, resolved_by: str | None = None) -> dict:
+    """状态推进（B1，v1.1 §3.4）。
+
+    status 必须在合法枚举内（不强制状态机顺序，允许跳转）；resolved 时自动记 resolved_at；
+    找不到指令 → ValueError。
+    """
+    if status is not None and status not in DIRECTIVE_STATUSES:
+        raise ValueError(f"invalid directive status: {status}")
+    conn = _get_conn(project)
+    try:
+        row = conn.execute(
+            "SELECT * FROM directives WHERE project = ? AND id = ?", (project, id)
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"directive not found: {id}")
+
+        sets: list[str] = []
+        params: list = []
+        if status is not None:
+            sets.append("status = ?")
+            params.append(status)
+        if outcome is not None:
+            sets.append("outcome = ?")
+            params.append(outcome)
+        if resolved_by is not None:
+            sets.append("resolved_by = ?")
+            params.append(resolved_by)
+        if status == "resolved" and not row["resolved_at"]:
+            sets.append("resolved_at = ?")
+            params.append(_now())
+        if sets:
+            params.extend([project, id])
+            conn.execute(
+                f"UPDATE directives SET {', '.join(sets)} WHERE project = ? AND id = ?",
+                params,
+            )
+            conn.commit()
+        updated = conn.execute(
+            "SELECT * FROM directives WHERE project = ? AND id = ?", (project, id)
+        ).fetchone()
+    finally:
+        conn.close()
+    return _row_to_dict(updated)
+
+
+def directive_repeat(project: str, id: str) -> dict:
+    """用户重复同一指令（B1 规则3）：repeat_count+1；≥2 时返回冻结提示（不实际冻结）。
+
+    冻结判断归 freeze_status（FREEZE_REPEAT_THRESHOLD=2）。
+    """
+    conn = _get_conn(project)
+    try:
+        row = conn.execute(
+            "SELECT * FROM directives WHERE project = ? AND id = ?", (project, id)
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"directive not found: {id}")
+        repeat_count = row["repeat_count"] + 1
+        conn.execute(
+            "UPDATE directives SET repeat_count = ? WHERE project = ? AND id = ?",
+            (repeat_count, project, id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    result = {"id": id, "repeat_count": repeat_count,
+              "freeze_hint": repeat_count >= FREEZE_REPEAT_THRESHOLD}
+    if repeat_count >= FREEZE_REPEAT_THRESHOLD:
+        result["message"] = "重复指令 ≥2，触发强制停止：先向用户汇报局面并请求决策"
+    return result
+
+
+def _active_work_summary(active_work) -> str:
+    """局面 active_work（dict）→ 单行摘要字符串（spec §3.7 示例 'discovery-3 FSM 追踪'）。"""
+    if isinstance(active_work, str):
+        return active_work
+    if isinstance(active_work, dict):
+        agent = active_work.get("agent") or ""
+        task = active_work.get("task") or ""
+        if agent and task:
+            return f"{agent} {task}"
+        if agent:
+            return agent
+        if task:
+            return task
+    return ""
+
+
+def preflight_check(project: str) -> dict:
+    """委派前总检查（F3 合并 B3 阻塞检查 + E2 freeze_status + 局面摘要）。
+
+    返回 {freeze, unresolved_directives, situation_summary}；
+    父 Agent 每次委派前唯一必须调用（spec §3.7）。
+    """
+    freeze = freeze_status(project)
+    unresolved = directive_list(project, status="!resolved", limit=100)
+    sit = situation_get(project)
+
+    conn = _get_conn(project)
+    try:
+        conflicts_pending = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM conflicts "
+            "WHERE project = ? AND status IN ('pending', 'under_review')",
+            (project,),
+        ).fetchone()["cnt"]
+    finally:
+        conn.close()
+
+    return {
+        "freeze": freeze,
+        "unresolved_directives": [
+            {"id": d["id"], "text": d["text"], "status": d["status"]} for d in unresolved
+        ],
+        "situation_summary": {
+            "objective": sit.get("objective", ""),
+            "active_work": _active_work_summary(sit.get("active_work", {})),
+            "conflicts_pending": conflicts_pending,
+        },
+    }
+
+
 # ─── 核心逻辑 ──────────────────────────────────────────────────────
 
 def _cascade_invalidate(conn: sqlite3.Connection, parent_id: str):
@@ -2092,6 +2346,131 @@ marker ∈ {conflict, active, disproved, candidate, directive, unverified}
                 "required": ["project"],
             },
         ),
+        Tool(
+            name="directive_create",
+            description="""创建用户指令待办（指挥层，v1.1 §3.4 / gap-plan B1）。
+
+type 省略 → 服务端用确定性解析器推断（优先级 stop>redirect>verify>question，纯规则无 LLM）；
+type=info（显式传或解析出）→ 不落库，返回 {skipped: true, reason: "info 不入待办"}。
+id 按 project 内 D-XXXX 递增（D-0001…），status='received'；
+anchor 传入优先（如 'challenge.exe>sub_4012a0'），文本中 node X.Y 提取仅作兜底。
+
+参数:
+  project — 项目名
+  text    — 用户指令原文
+  anchor  — 关联锚点（树节点 ID 或 finding ID，可选）
+  type    — 指令类型（可选）：verify|redirect|stop|question|info""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "项目名"},
+                    "text": {"type": "string", "description": "用户指令原文"},
+                    "anchor": {"type": "string", "description": "关联锚点（树节点 ID 或 finding ID）"},
+                    "type": {"type": "string", "enum": list(DIRECTIVE_TYPES), "description": "指令类型（省略时服务端解析推断）"},
+                },
+                "required": ["project", "text"],
+            },
+        ),
+        Tool(
+            name="directive_list",
+            description="""待办清单（v1.1 §3.4 / gap-plan B1）。
+
+默认按 created_at 升序（最旧优先）；status 过滤（精确值或否定式，如 "!resolved" → 未解决）。
+
+参数:
+  project — 项目名
+  status  — 状态过滤（可选）：received|acknowledged|in_progress|resolved|needs_clarify，或 "!<status>" 取反
+  limit   — 返回上限（默认 50）""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "项目名"},
+                    "status": {"type": "string", "description": "状态过滤（含否定式如 '!resolved'）"},
+                    "limit": {"type": "integer", "default": 50, "minimum": 1, "description": "返回上限"},
+                },
+                "required": ["project"],
+            },
+        ),
+        Tool(
+            name="directive_update",
+            description="""状态推进（v1.1 §3.4 / gap-plan B1）。
+
+status 合法枚举：received|acknowledged|in_progress|resolved|needs_clarify；
+status=resolved 时自动记 resolved_at=_now()；找不到指令 → 拒绝。
+
+参数:
+  project     — 项目名
+  id          — 指令 ID（如 D-0001）
+  status      — 新状态（可选）
+  outcome     — 处理结论（可选）
+  resolved_by — 处理者（agent-id | user，可选）""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "项目名"},
+                    "id": {"type": "string", "description": "指令 ID（如 D-0001）"},
+                    "status": {"type": "string", "enum": list(DIRECTIVE_STATUSES), "description": "新状态"},
+                    "outcome": {"type": "string", "description": "处理结论"},
+                    "resolved_by": {"type": "string", "description": "处理者（agent-id | user）"},
+                },
+                "required": ["project", "id"],
+            },
+        ),
+        Tool(
+            name="directive_repeat",
+            description="""用户重复同一指令（v1.1 §3.4 / gap-plan B1 规则3）。
+
+repeat_count+1；≥2 时返回 freeze_hint=true 与强制停止提示
+（不实际冻结，冻结判断归 freeze_status）。
+
+参数:
+  project — 项目名
+  id      — 指令 ID（如 D-0001）""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "项目名"},
+                    "id": {"type": "string", "description": "指令 ID（如 D-0001）"},
+                },
+                "required": ["project", "id"],
+            },
+        ),
+        Tool(
+            name="directive_parse",
+            description="""纯解析用户指令，不落库（v1.1 §3.4 / gap-plan B2，纯规则无 LLM）。
+
+优先级 stop > redirect > verify > question；引用 node X.Y → 默认 verify + 锚定；
+都不匹配 → info（纯信息补充）；空文本无法确定 → 兜底 redirect（宁多勿漏）。
+
+参数:
+  text   — 用户指令原文
+  anchor — 显式锚点（可选，优先于 node 提取）""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "description": "用户指令原文"},
+                    "anchor": {"type": "string", "description": "显式锚点（可选）"},
+                },
+                "required": ["text"],
+            },
+        ),
+        Tool(
+            name="preflight_check",
+            description="""委派前总检查（v1.1 §3.7 / gap-plan F3，合并 B3 阻塞检查 + E2 freeze_status + 局面摘要）。
+
+父 Agent 每次委派前唯一必须调用；unresolved_directives 非空 → 先处理再委派。
+返回 {freeze, unresolved_directives, situation_summary}。
+
+参数:
+  project — 项目名""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "项目名"},
+                },
+                "required": ["project"],
+            },
+        ),
     ]
 
 
@@ -2264,6 +2643,51 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 with_findings=arguments.get("with_findings", True),
             )
             return [TextContent(type="text", text=result)]
+
+        elif name == "directive_create":
+            result = directive_create(
+                project=arguments["project"],
+                text=arguments["text"],
+                anchor=arguments.get("anchor"),
+                type=arguments.get("type"),
+            )
+            return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+
+        elif name == "directive_list":
+            result = directive_list(
+                project=arguments["project"],
+                status=arguments.get("status"),
+                limit=arguments.get("limit", 50),
+            )
+            return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+
+        elif name == "directive_update":
+            result = directive_update(
+                project=arguments["project"],
+                id=arguments["id"],
+                status=arguments.get("status"),
+                outcome=arguments.get("outcome"),
+                resolved_by=arguments.get("resolved_by"),
+            )
+            return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+
+        elif name == "directive_repeat":
+            result = directive_repeat(
+                project=arguments["project"],
+                id=arguments["id"],
+            )
+            return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+
+        elif name == "directive_parse":
+            result = parse_directive(
+                text=arguments["text"],
+                anchor=arguments.get("anchor"),
+            )
+            return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+
+        elif name == "preflight_check":
+            result = preflight_check(project=arguments["project"])
+            return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
 
         else:
             return [TextContent(type="text", text=f"Unknown tool: {name}")]
