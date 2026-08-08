@@ -926,10 +926,12 @@ def update_finding(project: str, kid: str, fact: str | None = None,
         raise ValueError(f"Finding not found: {kid}")
 
     # ── 写库 gate（update 版，v1.1 §1.3）：只校验角色权责（标 confirmed-inferred/speculative 时）
+    #    仅当调用方显式传入 confidence 且目标级别受限时才触发——只改 evidence/tags 不触发，
+    #    避免误拒父 Agent 已批准的 confirmed-inferred 条目补证据。
     #    若改为 confirmed-inferred，还需 evidence 双 agent 交叉验证标记 ──
     new_confidence = confidence if confidence is not None else existing["confidence"]
     new_evidence = evidence if evidence is not None else existing["evidence"]
-    if new_confidence in _ROLE_GATED_CONFIDENCE:
+    if confidence is not None and confidence in _ROLE_GATED_CONFIDENCE:
         try:
             _check_role_authority(source, new_confidence)
             if new_confidence == "confirmed-inferred":
