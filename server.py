@@ -777,6 +777,403 @@ def freeze_release(project: str) -> dict:
     return status
 
 
+# ─── 状态层（v1.1 §3.2/§3.3/§3.7，gap-plan A1/A2/F1）：局面对象 + 树标记 + tree_render ──
+
+VALID_MARKERS = {"conflict", "active", "disproved", "candidate", "directive", "unverified"}
+_MARKER_ORDER = ["conflict", "active", "disproved", "candidate", "directive", "unverified"]
+MARKER_ICONS = {
+    "conflict": "⚠️",
+    "active": "🔄",
+    "disproved": "❌",
+    "candidate": "🎯",
+    "directive": "📌",
+    "unverified": "🔒",
+}
+# finding 置信度图标（§3.7：confirmed-observed/confirmed-inferred/likely 无图标）
+FINDING_CONFIDENCE_ICONS = {"disproved": "❌", "speculative": "🔒"}
+_TYPE_SHORT = {"observation": "obs", "claim": "claim", "hypothesis": "hyp", "task": "task"}
+_VALID_EVIDENCE_STRENGTH = {"high", "mid", "low"}
+_RENDER_SIZE_LIMIT = 6000
+
+# situations JSON 列 → 局面对象键名
+_SITUATION_JSON_COLS = [
+    ("progress_json", "progress"),
+    ("active_work_json", "active_work"),
+    ("conflict_queue_json", "conflict_queue"),
+    ("candidate_directions_json", "candidate_directions"),
+    ("risks_json", "risks"),
+    ("user_directives_json", "user_directives"),
+    ("timeline_json", "timeline"),
+]
+
+
+def _truncate(s: str, n: int = 60) -> str:
+    """压缩为单行并截断超长文本（fact/指令文本渲染用），超长加 "…"。"""
+    s = (s or "").replace("\n", " ").strip()
+    return s if len(s) <= n else s[:n] + "…"
+
+
+def situation_get(project: str) -> dict:
+    """获取项目局面对象（v1.1 §3.3）。
+
+    无行时返回默认空局面（objective=''，各列表=[]，version=1，frozen=null），
+    不自动建行（纯读操作）。
+    """
+    conn = _get_conn(project)
+    try:
+        row = conn.execute(
+            "SELECT * FROM situations WHERE project = ?", (project,)
+        ).fetchone()
+    finally:
+        conn.close()
+
+    if row is None:
+        return {
+            "project": project,
+            "objective": "",
+            "progress": [],
+            "active_work": {},
+            "conflict_queue": [],
+            "candidate_directions": [],
+            "risks": [],
+            "user_directives": [],
+            "timeline": [],
+            "version": 1,
+            "frozen": None,
+            "frozen_at": None,
+            "updated_at": None,
+        }
+
+    d = _row_to_dict(row)
+    for col, key in _SITUATION_JSON_COLS:
+        raw = d.pop(col, None)
+        d[key] = json.loads(raw) if raw else ({} if col == "active_work_json" else [])
+    return d
+
+
+def situation_update(project: str, objective: str | None = None,
+                     progress: list | None = None, active_work: dict | None = None,
+                     candidate_directions: list | None = None, risks: list | None = None,
+                     timeline_event: dict | None = None) -> dict:
+    """更新项目局面对象（v1.1 §3.3）。
+
+    - 各列表字段 json 序列化存储；timeline_event={event, actor} 追加进 timeline（time 服务端补 _now()）
+    - version 每次 +1；表无行时先 INSERT 新行（objective 默认 ''），有行时 UPDATE
+    - 校验：candidate_directions 每项必须含 evidence_strength ∈ {high,mid,low}，缺失拒绝；
+      progress 每项 id 若引用不存在的 finding → 降级为纯文本摘要（去掉 id，gap-plan A1）
+    """
+    conn = _get_conn(project)
+    try:
+        row = conn.execute(
+            "SELECT * FROM situations WHERE project = ?", (project,)
+        ).fetchone()
+        if row is None:
+            conn.execute(
+                "INSERT INTO situations (project, objective, updated_at) VALUES (?, ?, ?)",
+                (project, objective or "", _now()),
+            )
+            row = conn.execute(
+                "SELECT * FROM situations WHERE project = ?", (project,)
+            ).fetchone()
+        cur = _row_to_dict(row)
+
+        # 校验：候选方向必须含 evidence_strength ∈ {high,mid,low}
+        if candidate_directions is not None:
+            if not isinstance(candidate_directions, list):
+                raise ValueError("candidate_directions must be a list")
+            for item in candidate_directions:
+                if not isinstance(item, dict) or "evidence_strength" not in item:
+                    raise ValueError(
+                        f"candidate_directions 每项必须含 evidence_strength ∈ {{high,mid,low}}，缺失: {item!r}")
+                if item["evidence_strength"] not in _VALID_EVIDENCE_STRENGTH:
+                    raise ValueError(
+                        f"invalid evidence_strength: {item['evidence_strength']!r} "
+                        f"(must be high/mid/low)")
+
+        # progress id 引用不存在 → 降级为纯文本摘要（拒绝或降级二选一，取降级）
+        if progress is not None:
+            if not isinstance(progress, list):
+                raise ValueError("progress must be a list")
+            normalized = []
+            for item in progress:
+                if not isinstance(item, dict):
+                    raise ValueError(f"progress 每项必须为对象: {item!r}")
+                if item.get("id"):
+                    exists = conn.execute(
+                        "SELECT 1 FROM knowledge WHERE id = ? AND project = ?",
+                        (item["id"], project),
+                    ).fetchone()
+                    if not exists:
+                        item = {k: v for k, v in item.items() if k != "id"}
+                normalized.append(item)
+            progress = normalized
+
+        # timeline_event 校验 + 追加（time 服务端补 _now()）
+        new_timeline_json = None
+        if timeline_event is not None:
+            if (not isinstance(timeline_event, dict)
+                    or "event" not in timeline_event or "actor" not in timeline_event):
+                raise ValueError("timeline_event must be {event, actor}")
+            timeline = json.loads(cur["timeline_json"] or "[]")
+            timeline.append({
+                "time": _now(),
+                "event": timeline_event["event"],
+                "actor": timeline_event["actor"],
+            })
+            new_timeline_json = json.dumps(timeline, ensure_ascii=False)
+
+        updates: dict = {}
+        if objective is not None:
+            updates["objective"] = objective
+        if progress is not None:
+            updates["progress_json"] = json.dumps(progress, ensure_ascii=False)
+        if active_work is not None:
+            updates["active_work_json"] = json.dumps(active_work, ensure_ascii=False)
+        if candidate_directions is not None:
+            updates["candidate_directions_json"] = json.dumps(candidate_directions, ensure_ascii=False)
+        if risks is not None:
+            updates["risks_json"] = json.dumps(risks, ensure_ascii=False)
+        if new_timeline_json is not None:
+            updates["timeline_json"] = new_timeline_json
+
+        updates["version"] = (cur["version"] or 1) + 1
+        updates["updated_at"] = _now()
+
+        if updates:
+            sets = ", ".join(f"{k} = ?" for k in updates)
+            conn.execute(
+                f"UPDATE situations SET {sets} WHERE project = ?",
+                (*updates.values(), project),
+            )
+            conn.commit()
+    finally:
+        conn.close()
+
+    return situation_get(project)
+
+
+def situation_report(project: str) -> str:
+    """生成局面推送文本（v1.1 §3.3 使用例格式），供直接推送给用户。
+
+    行格式：📊 局面 / ✅ 已完成（progress 摘要）/ 🔄 活跃（active_work）/
+    ⚠️ 冲突（conflicts 表 pending+under_review 数量与摘要）/ 🎯 候选方向（含证据强度）/
+    📌 待办指令（directives 未解决数量）。无数据项省略对应行。
+    """
+    conn = _get_conn(project)
+    try:
+        row = conn.execute(
+            "SELECT * FROM situations WHERE project = ?", (project,)
+        ).fetchone()
+        conflicts = conn.execute(
+            "SELECT id, party_a_summary, party_b_summary FROM conflicts "
+            "WHERE project = ? AND status IN ('pending', 'under_review') "
+            "ORDER BY created_at, id",
+            (project,),
+        ).fetchall()
+        directives = conn.execute(
+            "SELECT id, text FROM directives "
+            "WHERE project = ? AND status != 'resolved' ORDER BY created_at, id",
+            (project,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    lines: list[str] = []
+    if row is not None:
+        d = _row_to_dict(row)
+        if d["objective"]:
+            lines.append(f"📊 局面：{d['objective']}")
+
+        progress = json.loads(d["progress_json"] or "[]")
+        if progress:
+            parts = "｜".join(
+                f"{_truncate(p.get('summary') or p.get('id') or '', 60)}（{p.get('confidence', '')}）"
+                for p in progress
+            )
+            lines.append(f"✅ 已完成：{parts}")
+
+        active_work = json.loads(d["active_work_json"] or "{}")
+        if active_work:
+            agent = active_work.get("agent", "")
+            task = active_work.get("task", "")
+            if agent and task:
+                lines.append(f"🔄 活跃：{agent} 在{task}")
+            elif agent:
+                lines.append(f"🔄 活跃：{agent} 活跃中")
+
+        candidates = json.loads(d["candidate_directions_json"] or "[]")
+        if candidates:
+            parts = "｜".join(
+                f"（{c.get('evidence_strength', '?')}）：{_truncate(c.get('direction') or '', 60)}"
+                for c in candidates
+            )
+            lines.append(f"🎯 候选方向{parts}")
+
+    if conflicts:
+        parts = "｜".join(
+            f"{c['id']} {_truncate(c['party_a_summary'], 30)} vs {_truncate(c['party_b_summary'], 30)}"
+            for c in conflicts
+        )
+        lines.append(f"⚠️ 冲突 {len(conflicts)} 项：{parts}")
+
+    if directives:
+        parts = "｜".join(f"{d['id']} {_truncate(d['text'], 60)}" for d in directives)
+        lines.append(f"📌 待办指令 {len(directives)} 条：{parts}")
+
+    lines.append("（无开放式提问）")
+    return "\n".join(lines)
+
+
+def tree_mark(project: str, node_id: str, marker: str) -> dict:
+    """给树节点添加状态标记（v1.1 §3.2）。重复添加自动去重，节点不存在拒绝。
+
+    返回更新后的节点（markers 解析为列表）。
+    """
+    if marker not in VALID_MARKERS:
+        raise ValueError(f"Invalid marker: {marker!r}. Must be one of {sorted(VALID_MARKERS)}")
+    return _tree_set_marker(project, node_id, marker, add=True)
+
+
+def tree_unmark(project: str, node_id: str, marker: str) -> dict:
+    """移除树节点状态标记（v1.1 §3.2）。标记不存在时无副作用。
+
+    返回更新后的节点（markers 解析为列表）。
+    """
+    if marker not in VALID_MARKERS:
+        raise ValueError(f"Invalid marker: {marker!r}. Must be one of {sorted(VALID_MARKERS)}")
+    return _tree_set_marker(project, node_id, marker, add=False)
+
+
+def _tree_set_marker(project: str, node_id: str, marker: str, add: bool) -> dict:
+    conn = _get_conn(project)
+    try:
+        row = conn.execute(
+            "SELECT * FROM tree_nodes WHERE id = ? AND project = ?",
+            (node_id, project),
+        ).fetchone()
+        if not row:
+            raise ValueError(f"Tree node not found: {node_id}")
+        markers = json.loads(row["markers_json"] or "[]")
+        if add:
+            if marker not in markers:
+                markers.append(marker)
+        else:
+            if marker in markers:
+                markers.remove(marker)
+        conn.execute(
+            "UPDATE tree_nodes SET markers_json = ? WHERE id = ?",
+            (json.dumps(markers, ensure_ascii=False), node_id),
+        )
+        conn.commit()
+        result = _row_to_dict(row)
+        result["markers"] = markers
+        result.pop("markers_json", None)
+        return result
+    finally:
+        conn.close()
+
+
+def tree_render(project: str, node_id: str | None = None,
+                max_depth: int = 4, with_findings: bool = True) -> str:
+    """渲染缩进树视图（v1.1 §3.7 / gap-plan F1）。
+
+    - node_id 缺省 → project 根节点；深度优先编号（1、1.1、1.1.1），根行无编号
+    - finding 行：[type] fact (confidence) [图标] ← 编号；fact 超 60 字符截断加 "…"
+    - 图标：节点 markers（⚠️🔄❌🎯📌🔒）；finding 置信度（disproved=❌、speculative=🔒，其余无）
+    - findings 与子节点共享编号序列（findings 在前）；体积超 ~6000 字符自动截断并提示下钻
+    """
+    if node_id is None:
+        node_id = project
+    conn = _get_conn(project)
+    try:
+        root = conn.execute(
+            "SELECT * FROM tree_nodes WHERE id = ? AND project = ?",
+            (node_id, project),
+        ).fetchone()
+        if not root:
+            raise ValueError(f"Tree node not found: {node_id}")
+
+        out: list[str] = []
+        size = 0
+        truncated = False
+
+        def _emit(line: str) -> bool:
+            nonlocal size, truncated
+            if truncated:
+                return False
+            if size + len(line) + 1 > _RENDER_SIZE_LIMIT:
+                truncated = True
+                return False
+            out.append(line)
+            size += len(line) + 1
+            return True
+
+        def _node_icons(node) -> str:
+            markers = json.loads(node["markers_json"] or "[]")
+            icons = [MARKER_ICONS[m] for m in _MARKER_ORDER if m in markers]
+            return (" " + " ".join(icons)) if icons else ""
+
+        def _children_of(nid: str):
+            return conn.execute(
+                "SELECT * FROM tree_nodes WHERE parent_id = ? ORDER BY sort_order, name",
+                (nid,),
+            ).fetchall()
+
+        def _findings_of(nid: str):
+            return conn.execute(
+                "SELECT * FROM knowledge WHERE tree_node_id = ? ORDER BY created_at, rowid",
+                (nid,),
+            ).fetchall()
+
+        def _finding_line(f, num: str) -> str:
+            tshort = _TYPE_SHORT.get(f["type"] or "claim", "claim")
+            fact = _truncate(f["fact"], 60)
+            icon = FINDING_CONFIDENCE_ICONS.get(f["confidence"], "")
+            line = f"[{tshort}] {fact} ({f['confidence']})"
+            if icon:
+                line += f" {icon}"
+            return f"{line} ← {num}"
+
+        def _render_node(node, num_parts: list[int], depth: int, prefix: str, is_last: bool):
+            num = ".".join(str(p) for p in num_parts)
+            branch = "└── " if is_last else "├── "
+            if not _emit(f"{prefix}{branch}{num} {node['name']}{_node_icons(node)}"):
+                return
+            if depth >= max_depth:
+                return
+            child_prefix = prefix + ("    " if is_last else "│   ")
+            virtual = []
+            if with_findings:
+                virtual += [("f", x) for x in _findings_of(node["id"])]
+            virtual += [("n", x) for x in _children_of(node["id"])]
+            for i, (kind, item) in enumerate(virtual):
+                last = i == len(virtual) - 1
+                sub = num_parts + [i + 1]
+                if kind == "f":
+                    b = "└── " if last else "├── "
+                    fnum = ".".join(str(p) for p in sub)
+                    if not _emit(f"{child_prefix}{b}{_finding_line(item, fnum)}"):
+                        return
+                else:
+                    _render_node(item, sub, depth + 1, child_prefix, last)
+
+        _emit(root["name"])
+        kids = _children_of(root["id"])
+        for i, k in enumerate(kids):
+            _render_node(k, [i + 1], 1, "", i == len(kids) - 1)
+
+        text = "\n".join(out)
+        if truncated:
+            text = text[:_RENDER_SIZE_LIMIT]
+            cut = text.rfind("\n")
+            if cut > 0:
+                text = text[:cut]
+            text += "\n（节点过多，请用 node_id 下钻）"
+        return text
+    finally:
+        conn.close()
+
+
 # ─── 核心逻辑 ──────────────────────────────────────────────────────
 
 def _cascade_invalidate(conn: sqlite3.Connection, parent_id: str):
@@ -1563,6 +1960,138 @@ frozen=false 时 reason 为空列表。响应:
                 "required": ["project"],
             },
         ),
+        Tool(
+            name="situation_get",
+            description="""获取项目局面对象（状态层，v1.1 §3.3）。
+
+响应: {project, objective, progress, active_work, conflict_queue, candidate_directions,
+risks, user_directives, timeline, version, frozen, frozen_at, updated_at}
+无局面记录时返回默认空局面（objective=''、各列表=[]、version=1、frozen=null），不自动建行。
+
+参数:
+  project — 项目名""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "项目名"},
+                },
+                "required": ["project"],
+            },
+        ),
+        Tool(
+            name="situation_update",
+            description="""更新项目局面对象（状态层，v1.1 §3.3）。
+
+- 各列表字段 json 序列化存储；timeline_event={event, actor} 追加进 timeline（time 服务端补）
+- version 每次 +1；无局面记录时自动建行（objective 默认 ''）
+- 校验：candidate_directions 每项必须含 evidence_strength ∈ {high,mid,low}，缺失拒绝
+
+参数:
+  project             — 项目名
+  objective           — 当前目标（可选）
+  progress            — 已完成摘要列表 [{id, summary, confidence}]（id 引用不存在的 finding 时降级为纯文本）
+  active_work         — 活跃工作对象 {agent, task, last_heartbeat}
+  candidate_directions— 候选方向列表 [{direction, evidence_strength}]（evidence_strength 必填）
+  risks               — 风险列表
+  timeline_event      — 追加时间线事件 {event, actor}""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "项目名"},
+                    "objective": {"type": "string", "description": "当前目标"},
+                    "progress": {"type": "array", "items": {"type": "object"}, "description": "已完成摘要列表"},
+                    "active_work": {"type": "object", "description": "活跃工作 {agent, task, last_heartbeat}"},
+                    "candidate_directions": {"type": "array", "items": {"type": "object"}, "description": "候选方向 [{direction, evidence_strength}]"},
+                    "risks": {"type": "array", "items": {"type": "string"}, "description": "风险列表"},
+                    "timeline_event": {"type": "object", "description": "时间线事件 {event, actor}"},
+                },
+                "required": ["project"],
+            },
+        ),
+        Tool(
+            name="situation_report",
+            description="""生成局面推送文本（状态层，v1.1 §3.3 使用例格式），供直接推送给用户。
+
+行格式：📊 局面 / ✅ 已完成 / 🔄 活跃 / ⚠️ 冲突（数量+摘要）/
+🎯 候选方向（含证据强度）/ 📌 待办指令（数量）。无数据项省略对应行。
+
+参数:
+  project — 项目名""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "项目名"},
+                },
+                "required": ["project"],
+            },
+        ),
+        Tool(
+            name="tree_mark",
+            description="""给树节点添加状态标记（树类，v1.1 §3.2）。重复添加自动去重。
+
+marker ∈ {conflict, active, disproved, candidate, directive, unverified}
+响应: 更新后的节点（含 markers 列表）。节点不存在或 marker 非法 → 拒绝。
+
+参数:
+  project — 项目名
+  node_id — 树节点 ID（完整路径，如 'HITCON2024_rev1>challenge.exe>sub_4012a0'）
+  marker  — 标记名""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "项目名"},
+                    "node_id": {"type": "string", "description": "树节点 ID"},
+                    "marker": {"type": "string", "enum": sorted(VALID_MARKERS), "description": "状态标记"},
+                },
+                "required": ["project", "node_id", "marker"],
+            },
+        ),
+        Tool(
+            name="tree_unmark",
+            description="""移除树节点状态标记（树类，v1.1 §3.2）。标记不存在时无副作用。
+
+marker ∈ {conflict, active, disproved, candidate, directive, unverified}
+响应: 更新后的节点（含 markers 列表）。
+
+参数:
+  project — 项目名
+  node_id — 树节点 ID（完整路径）
+  marker  — 标记名""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "项目名"},
+                    "node_id": {"type": "string", "description": "树节点 ID"},
+                    "marker": {"type": "string", "enum": sorted(VALID_MARKERS), "description": "状态标记"},
+                },
+                "required": ["project", "node_id", "marker"],
+            },
+        ),
+        Tool(
+            name="tree_render",
+            description="""渲染缩进树视图（交互/共享，v1.1 §3.7 / gap-plan F1）。
+
+- node_id 缺省 → project 根节点；深度优先编号（1、1.1、1.1.1），根行无编号
+- finding 行：[type] fact (confidence) [图标] ← 编号；fact 超 60 字符截断
+- 图标：节点 markers（⚠️🔄❌🎯📌🔒）；finding 置信度（disproved=❌、speculative=🔒）
+- 体积超 ~6000 字符自动截断并提示用 node_id 下钻
+
+参数:
+  project      — 项目名
+  node_id      — 起始节点 ID（可选，默认项目根）
+  max_depth    — 最大深度（默认 4）
+  with_findings— 是否渲染挂载的 findings（默认 true）""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "项目名"},
+                    "node_id": {"type": "string", "description": "起始节点 ID（可选）"},
+                    "max_depth": {"type": "integer", "default": 4, "minimum": 1, "description": "最大深度"},
+                    "with_findings": {"type": "boolean", "default": True, "description": "是否渲染 findings"},
+                },
+                "required": ["project"],
+            },
+        ),
     ]
 
 
@@ -1690,6 +2219,51 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         elif name == "freeze_release":
             result = freeze_release(project=arguments["project"])
             return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+
+        elif name == "situation_get":
+            result = situation_get(project=arguments["project"])
+            return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+
+        elif name == "situation_update":
+            result = situation_update(
+                project=arguments["project"],
+                objective=arguments.get("objective"),
+                progress=arguments.get("progress"),
+                active_work=arguments.get("active_work"),
+                candidate_directions=arguments.get("candidate_directions"),
+                risks=arguments.get("risks"),
+                timeline_event=arguments.get("timeline_event"),
+            )
+            return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+
+        elif name == "situation_report":
+            result = situation_report(project=arguments["project"])
+            return [TextContent(type="text", text=result)]
+
+        elif name == "tree_mark":
+            result = tree_mark(
+                project=arguments["project"],
+                node_id=arguments["node_id"],
+                marker=arguments["marker"],
+            )
+            return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+
+        elif name == "tree_unmark":
+            result = tree_unmark(
+                project=arguments["project"],
+                node_id=arguments["node_id"],
+                marker=arguments["marker"],
+            )
+            return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+
+        elif name == "tree_render":
+            result = tree_render(
+                project=arguments["project"],
+                node_id=arguments.get("node_id"),
+                max_depth=arguments.get("max_depth", 4),
+                with_findings=arguments.get("with_findings", True),
+            )
+            return [TextContent(type="text", text=result)]
 
         else:
             return [TextContent(type="text", text=f"Unknown tool: {name}")]
