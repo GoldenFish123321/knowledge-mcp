@@ -473,11 +473,16 @@ def _tree_node_to_dict(row: sqlite3.Row) -> dict:
 
 
 def tree_store(project: str, path: str, node_type: str = "function",
-               parent_path: str | None = None) -> dict:
+               parent_path: str | None = None,
+               status: str | None = None,
+               markers: list | None = None) -> dict:
     """创建或更新树节点。
 
     自动创建路径上所有缺失的中间节点。
     parent_path 可选：指定父路径而非从 project 根开始。
+    status 可选：节点状态（自由字符串，默认列值 'normal'；不传不改动已有值）。
+    markers 可选：状态标记列表（合法值见 VALID_MARKERS，复用 tree_mark 校验逻辑，
+    去重保序后完整替换写入；不传不改动已有标记）。
     """
     if node_type not in VALID_NODE_TYPES:
         raise ValueError(f"Invalid node_type: {node_type}. Must be one of {VALID_NODE_TYPES}")
@@ -495,6 +500,30 @@ def tree_store(project: str, path: str, node_type: str = "function",
 
         node_id = _ensure_tree_path(conn, project,
                                     TREE_SEP.join(segments), node_type)
+
+        # status / markers 显式传入时写入（不传则保持列默认或已有值，向后兼容）
+        if status is not None or markers is not None:
+            updates = []
+            params = []
+            if status is not None:
+                if not str(status).strip():
+                    raise ValueError("status must not be empty")
+                updates.append("status = ?")
+                params.append(status)
+            if markers is not None:
+                for m in markers:
+                    if m not in VALID_MARKERS:
+                        raise ValueError(
+                            f"Invalid marker: {m!r}. Must be one of {sorted(VALID_MARKERS)}"
+                        )
+                # 去重保序（与 tree_mark 语义一致），完整替换写入
+                seen = set()
+                deduped = [m for m in markers if not (m in seen or seen.add(m))]
+                updates.append("markers_json = ?")
+                params.append(json.dumps(deduped, ensure_ascii=False))
+            params.append(node_id)
+            conn.execute(f"UPDATE tree_nodes SET {', '.join(updates)} WHERE id = ?", params)
+            conn.commit()
 
         # 获取完整节点信息
         row = conn.execute(
@@ -2314,8 +2343,9 @@ def store_finding(project: str, fact: str, confidence: str, source: str,
 
 def search_findings(project: str, query: str = "", confidence: str | None = None,
                     tag: str | None = None, tree_node_id: str | None = None,
-                    limit: int = 20, use_fts: bool = False) -> list[dict]:
-    """搜索发现。tree_node_id 可选，过滤特定树节点下的 findings。
+                    limit: int = 20, use_fts: bool = False,
+                    type: str | None = None) -> list[dict]:
+    """搜索发现。tree_node_id 可选，过滤特定树节点下的 findings；type 可选，过滤信息对象类型。
 
     use_fts=True 且 query 非空 → 走 knowledge_fts MATCH（query 按空白拆词 AND 连接），
     从 knowledge 表按 rowid 回查完整记录；MATCH 语法异常时回退 LIKE。
@@ -2348,6 +2378,9 @@ def search_findings(project: str, query: str = "", confidence: str | None = None
     if tree_node_id:
         conditions.append("k.tree_node_id = ?")
         params.append(tree_node_id)
+    if type:
+        conditions.append("k.type = ?")
+        params.append(type)
 
     where = " AND ".join(conditions)
     rows = []
@@ -2514,6 +2547,10 @@ async def list_tools() -> list[Tool]:
   evidence    — 证据摘要（工具输出/反汇编片段/用户原话，≤500字符推荐）
   based_on    — 推理来源的 finding ID，用于追溯推理链
   tags        — 标签列表（如 ['crypto','rc4']）
+  type        — 信息对象类型：observation|claim|hypothesis|task（默认 claim；claim 必须 based_on 一个 observation；hypothesis 的 fact 须含 test_plan:；task 须传 task_budget）
+  task_budget — type=task 时必填：{budget_tool_calls, budget_tokens, budget_seconds}（预算三字段）
+  task_dependencies — type=task 时的依赖 finding ID 列表（可选）
+  task_agent — type=task 时的执行 agent-id（可选）
   tree_path   — 树状结构路径，如 'challenge.exe>sub_4012a0'（> 分隔层级），自动创建路径上所有缺失节点
   evidence_uri — artifact:// URI（如 'artifact://tool_output/PROJ/3fa2b1c9.txt'），指向原始工具输出，配合 artifact_store 使用""",
             inputSchema={
@@ -2526,6 +2563,27 @@ async def list_tools() -> list[Tool]:
                     "evidence": {"type": "string", "default": "", "description": "证据摘要"},
                     "based_on": {"type": "string", "description": "推理来源 finding ID"},
                     "tags": {"type": "array", "items": {"type": "string"}, "description": "标签列表"},
+                    "type": {
+                        "type": "string",
+                        "enum": sorted(VALID_TYPES),
+                        "default": "claim",
+                        "description": "信息对象类型（默认 claim）",
+                    },
+                    "task_budget": {
+                        "type": "object",
+                        "properties": {
+                            "budget_tool_calls": {"type": "integer"},
+                            "budget_tokens": {"type": "integer"},
+                            "budget_seconds": {"type": "integer"},
+                        },
+                        "description": "type=task 时必填：预算三字段",
+                    },
+                    "task_dependencies": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "type=task 时的依赖 finding ID 列表",
+                    },
+                    "task_agent": {"type": "string", "description": "type=task 时的执行 agent-id"},
                     "tree_path": {"type": "string", "description": "树状结构路径，如 'challenge.exe>sub_4012a0'"},
                     "evidence_uri": {"type": "string", "description": "artifact:// URI，指向原始工具输出（配合 artifact_store 使用）"},
                 },
@@ -2543,6 +2601,7 @@ async def list_tools() -> list[Tool]:
     'confirmed' 快捷匹配 confirmed-observed + confirmed-inferred（兼容旧版）
   - tag 过滤标签
   - tree_node_id 过滤特定树节点下的 findings
+  - type 过滤信息对象类型（observation/claim/hypothesis/task）
   - 多条件 AND 逻辑
   - 按创建时间倒序
   - use_fts=true 时走 FTS5 全文索引（query 按空白拆词 AND 匹配；query 为空时回退 LIKE）
@@ -2553,6 +2612,7 @@ async def list_tools() -> list[Tool]:
   confidence    — 置信度过滤
   tag           — 标签过滤
   tree_node_id  — 树节点 ID，过滤该节点下的所有 findings
+  type          — 信息对象类型过滤（observation|claim|hypothesis|task，可选）
   limit         — 返回上限（默认20）
   use_fts       — 是否使用 FTS5 全文索引（默认 false）""",
             inputSchema={
@@ -2563,6 +2623,11 @@ async def list_tools() -> list[Tool]:
                     "confidence": {"type": "string", "description": "置信度过滤"},
                     "tag": {"type": "string", "description": "标签过滤"},
                     "tree_node_id": {"type": "string", "description": "树节点 ID"},
+                    "type": {
+                        "type": "string",
+                        "enum": sorted(VALID_TYPES),
+                        "description": "信息对象类型过滤（observation|claim|hypothesis|task）",
+                    },
                     "limit": {"type": "integer", "default": 20, "minimum": 1, "maximum": 100},
                     "use_fts": {"type": "boolean", "default": False, "description": "使用 FTS5 全文索引"},
                 },
@@ -2606,6 +2671,7 @@ async def list_tools() -> list[Tool]:
   confidence — 新的置信度（可选）
   evidence   — 新的证据（可选）
   tags       — 新的标签列表（可选，完整替换）
+  source     — 来源描述（可选；将置信度升级到 confirmed-inferred/speculative 时需要，含 role:xxx 供角色权责校验）
   tree_path  — 树路径，如 'challenge.exe>sub_4012a0'（⚠️ 一般不用，仅用户要求时使用）
   evidence_uri — 新的 artifact:// URI（可选，指向原始工具输出）""",
             inputSchema={
@@ -2617,6 +2683,7 @@ async def list_tools() -> list[Tool]:
                     "confidence": {"type": "string", "enum": sorted(VALID_CONFIDENCE)},
                     "evidence": {"type": "string"},
                     "tags": {"type": "array", "items": {"type": "string"}},
+                    "source": {"type": "string", "description": "来源描述（升级到 confirmed-inferred/speculative 时需要，含 role:xxx）"},
                     "tree_path": {"type": "string", "description": "树路径，如 'challenge.exe>sub_4012a0'（⚠️ 一般不用）"},
                     "evidence_uri": {"type": "string", "description": "新的 artifact:// URI（可选）"},
                 },
@@ -2640,7 +2707,9 @@ async def list_tools() -> list[Tool]:
   project      — 项目名
   path         — 树路径，如 'challenge.exe>sub_4012a0'（> 分隔层级）
   node_type    — 叶子节点类型（默认 'function'）
-  parent_path  — 父路径（可选，指定后 path 拼接到父路径下）""",
+  parent_path  — 父路径（可选，指定后 path 拼接到父路径下）
+  status       — 节点状态（可选，自由字符串如 'normal'/'active'，默认 'normal'；不传不改动已有值）
+  markers      — 状态标记列表（可选，合法值 {conflict, active, disproved, candidate, directive, unverified}，去重后完整替换写入；不传不改动已有标记）""",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -2653,6 +2722,12 @@ async def list_tools() -> list[Tool]:
                         "description": "节点类型"
                     },
                     "parent_path": {"type": "string", "description": "父路径（可选）"},
+                    "status": {"type": "string", "description": "节点状态（自由字符串，默认 normal）"},
+                    "markers": {
+                        "type": "array",
+                        "items": {"type": "string", "enum": sorted(VALID_MARKERS)},
+                        "description": "状态标记列表（去重后完整替换写入）",
+                    },
                 },
                 "required": ["project", "path"],
             },
@@ -3367,6 +3442,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 tree_node_id=arguments.get("tree_node_id"),
                 limit=arguments.get("limit", 20),
                 use_fts=arguments.get("use_fts", False),
+                type=arguments.get("type"),
             )
             return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
 
@@ -3399,6 +3475,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 path=arguments["path"],
                 node_type=arguments.get("node_type", "function"),
                 parent_path=arguments.get("parent_path"),
+                status=arguments.get("status"),
+                markers=arguments.get("markers"),
             )
             return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
 
@@ -3634,12 +3712,14 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
 
         else:
-            return [TextContent(type="text", text=f"Unknown tool: {name}")]
+            raise ValueError(f"Unknown tool: {name}")
 
     except ValueError as e:
+        # 写库 gate 违规 / 参数校验错误统一走这里（write_gate_violation 识别依赖此分支）
         return [TextContent(type="text", text=json.dumps({"error": str(e)}, ensure_ascii=False))]
     except Exception as e:
-        return [TextContent(type="text", text=json.dumps({"error": f"Internal error: {str(e)}"}, ensure_ascii=False))]
+        # catch-all：TypeError/KeyError/sqlite3.Error 等一律转 JSON error，不炸原始堆栈
+        return [TextContent(type="text", text=json.dumps({"error": str(e)}, ensure_ascii=False))]
 
 
 async def main():

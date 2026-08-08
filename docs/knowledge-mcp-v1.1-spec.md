@@ -668,7 +668,7 @@ CREATE VIRTUAL TABLE knowledge_fts USING fts5(
   "output": "0x61C88647"
 }
 // 响应
-{"uri": "artifact://tool_output/D3CTF2026_d3llvm/3fa2b1c9.txt", "bytes": 12}
+{"uri": "artifact://tool_output/D3CTF2026_d3llvm/3fa2b1c9.txt", "bytes": 10}
 ```
 
 #### artifact_get — 取回原始输出

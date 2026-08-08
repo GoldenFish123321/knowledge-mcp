@@ -149,6 +149,7 @@ v1.1 新增参数：
 
 v1.1 新增参数：
 - `use_fts` — 是否使用 FTS5 全文索引（默认 false）。true 时 query 按空白拆词 AND 匹配，命中精度更高；query 为空或 MATCH 语法异常时自动回退 LIKE
+- `type` — 按信息对象类型过滤（observation/claim/hypothesis/task）
 
 多条件 AND 逻辑，按创建时间倒序。
 
@@ -271,8 +272,8 @@ D3CTF2026_d3llvm
   "reporter": "detector-2",
   "tree_node_id": "D3CTF2026_d3llvm>challenge.exe>sub_4012a0"
 }
-// 响应（示意）
-{"id": "C-0001", "status": "pending", "conflict_type": 1, "tree_marked": true}
+// 响应（示意：返回 conflicts 表行；tree_node_id 传入时会先给该节点加 conflict 标记，但响应中无 tree_marked 字段）
+{"id": "C-0001", "status": "pending", "conflict_type": 1, "reporter": "detector-2", "created_at": "2026-08-04T12:07:00Z"}
 ```
 
 ### G5 快照裁剪 + artifact（4 个）
