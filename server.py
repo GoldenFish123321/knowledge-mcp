@@ -565,6 +565,218 @@ def tree_delete(project: str, node_id: str) -> dict:
     return result
 
 
+# ─── 监督层（v1.1 §3.6 E 组）：audit 审计 + freeze 冻结状态 ──────────
+# 规则编号（v1.1 §1.2 ⑥）：
+#   R1 委派前无 search | R2 同假设失败≥2 | R3 汇报无置信度 | R4 委派 context 无验证 | R5 冻结触发
+# 自动冻结条件（v1.1 §3.6）：违规计数≥3 OR 未解决待办≥3 OR 存在 repeat_count≥2 的指令；
+# 显式冻结由 freeze_trigger 写 situations.frozen（非空）触发。MCP 侧只做状态存储与查询原语，
+# "冻结拦截" 属平台层 hook（gap-plan §6.3：MCP 边界 = 状态存储 + 查询）。
+
+FREEZE_VIOLATION_THRESHOLD = 3      # 违规计数阈值（audit_log count）
+FREEZE_UNRESOLVED_THRESHOLD = 3     # 未解决待办阈值（directives status != 'resolved'）
+FREEZE_REPEAT_THRESHOLD = 2         # 重复指令阈值（directives repeat_count）
+_EXPLICIT_FREEZE_PREFIX = "显式冻结"  # reason 中显式冻结项前缀，与自动触发项区分
+
+
+def audit_violation(project: str, actor: str, rule_id: str, detail: str) -> dict:
+    """记一条违规到 audit_log，返回完整记录（含自增 id）。
+
+    rule_id 取值（v1.1 §1.2 ⑥）：
+      R1 委派前无 search | R2 同假设失败≥2 | R3 汇报无置信度 |
+      R4 委派 context 无验证 | R5 冻结触发（freeze_trigger 自动记录）
+    """
+    conn = _get_conn(project)
+    try:
+        cur = conn.execute(
+            "INSERT INTO audit_log (project, actor, rule_id, detail, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (project, actor, rule_id, detail, _now()),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM audit_log WHERE id = ?", (cur.lastrowid,)
+        ).fetchone()
+        return _row_to_dict(row)
+    finally:
+        conn.close()
+
+
+def audit_list(project: str, rule_id: str | None = None, limit: int = 50) -> list[dict]:
+    """列出审计日志，按 created_at 倒序（id 倒序作同秒 tiebreaker）。"""
+    conn = _get_conn(project)
+    try:
+        if rule_id:
+            rows = conn.execute(
+                "SELECT * FROM audit_log WHERE project = ? AND rule_id = ? "
+                "ORDER BY created_at DESC, id DESC LIMIT ?",
+                (project, rule_id, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM audit_log WHERE project = ? "
+                "ORDER BY created_at DESC, id DESC LIMIT ?",
+                (project, limit),
+            ).fetchall()
+        return [_row_to_dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def audit_stats(project: str) -> dict:
+    """审计统计：{by_rule: {R1: N, ...}, total: N, recent: [最近5条摘要]}。
+
+    recent 每条含 id/rule_id/detail（超 80 字符截断为摘要）/created_at。
+    """
+    conn = _get_conn(project)
+    try:
+        by_rule_rows = conn.execute(
+            "SELECT rule_id, COUNT(*) AS cnt FROM audit_log "
+            "WHERE project = ? GROUP BY rule_id ORDER BY rule_id",
+            (project,),
+        ).fetchall()
+        by_rule = {r["rule_id"]: r["cnt"] for r in by_rule_rows}
+        total = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM audit_log WHERE project = ?", (project,)
+        ).fetchone()["cnt"]
+        recent_rows = conn.execute(
+            "SELECT id, rule_id, detail, created_at FROM audit_log "
+            "WHERE project = ? ORDER BY created_at DESC, id DESC LIMIT 5",
+            (project,),
+        ).fetchall()
+        recent = [
+            {
+                "id": r["id"],
+                "rule_id": r["rule_id"],
+                "detail": r["detail"] if len(r["detail"]) <= 80 else r["detail"][:80] + "…",
+                "created_at": r["created_at"],
+            }
+            for r in recent_rows
+        ]
+        return {"by_rule": by_rule, "total": total, "recent": recent}
+    finally:
+        conn.close()
+
+
+def freeze_status(project: str) -> dict:
+    """冻结状态检查：{frozen: bool, reason: [触发条件...], counts: {...}}。
+
+    冻结条件（任一满足即 frozen=true，frozen=false 时 reason=[]）：
+      - 显式冻结：situations.frozen 非空（freeze_trigger 写入的原因）
+      - 违规计数 ≥ FREEZE_VIOLATION_THRESHOLD（audit_log count）
+      - 未解决待办 ≥ FREEZE_UNRESOLVED_THRESHOLD（directives status != 'resolved'）
+      - 存在 repeat_count ≥ FREEZE_REPEAT_THRESHOLD 的指令
+    """
+    conn = _get_conn(project)
+    try:
+        sit = conn.execute(
+            "SELECT frozen FROM situations WHERE project = ?", (project,)
+        ).fetchone()
+        explicit_frozen = sit["frozen"] if sit else None
+
+        violations = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM audit_log WHERE project = ?", (project,)
+        ).fetchone()["cnt"]
+        unresolved = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM directives "
+            "WHERE project = ? AND status != 'resolved'",
+            (project,),
+        ).fetchone()["cnt"]
+        repeated = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM directives "
+            "WHERE project = ? AND repeat_count >= ?",
+            (project, FREEZE_REPEAT_THRESHOLD),
+        ).fetchone()["cnt"]
+
+        reasons = []
+        if explicit_frozen is not None:
+            reasons.append(f"{_EXPLICIT_FREEZE_PREFIX}: {explicit_frozen}")
+        if violations >= FREEZE_VIOLATION_THRESHOLD:
+            reasons.append(f"违规计数≥{FREEZE_VIOLATION_THRESHOLD}(实际{violations})")
+        if unresolved >= FREEZE_UNRESOLVED_THRESHOLD:
+            reasons.append(f"未解决待办≥{FREEZE_UNRESOLVED_THRESHOLD}(实际{unresolved})")
+        if repeated > 0:
+            reasons.append(f"存在 repeat_count≥{FREEZE_REPEAT_THRESHOLD} 的指令")
+
+        frozen = (
+            explicit_frozen is not None
+            or violations >= FREEZE_VIOLATION_THRESHOLD
+            or unresolved >= FREEZE_UNRESOLVED_THRESHOLD
+            or repeated > 0
+        )
+        return {
+            "frozen": frozen,
+            "reason": reasons,
+            "counts": {
+                "violations": violations,
+                "unresolved_directives": unresolved,
+                "repeated_directives": repeated,
+            },
+        }
+    finally:
+        conn.close()
+
+
+def freeze_trigger(project: str, reason: str) -> dict:
+    """显式冻结：situations upsert 写 frozen=reason + frozen_at=_now()，
+    同时 audit_violation 记一条 R5（actor='parent'，detail=reason）。
+
+    返回当前冻结状态（freeze_status 输出），并附 frozen_at 字段
+    （规格 §3.6 响应格式 {"frozen": true, "frozen_at": "..."}）。
+    """
+    conn = _get_conn(project)
+    try:
+        now = _now()
+        conn.execute(
+            "INSERT INTO situations (project, frozen, frozen_at, updated_at) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(project) DO UPDATE SET "
+            "frozen = excluded.frozen, frozen_at = excluded.frozen_at, "
+            "updated_at = excluded.updated_at",
+            (project, reason, now, now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    audit_violation(project, actor="parent", rule_id="R5", detail=reason)
+
+    status = freeze_status(project)
+    conn = _get_conn(project)
+    try:
+        sit = conn.execute(
+            "SELECT frozen_at FROM situations WHERE project = ?", (project,)
+        ).fetchone()
+        if sit and sit["frozen_at"]:
+            status["frozen_at"] = sit["frozen_at"]
+    finally:
+        conn.close()
+    return status
+
+
+def freeze_release(project: str) -> dict:
+    """解除显式冻结：清空 situations.frozen/frozen_at。
+
+    返回当前冻结状态（freeze_status 输出）；解除成功时附 released_at
+    （规格 §3.6 响应格式 {"frozen": false, "released_at": "..."}）。
+    注意：自动触发的冻结（违规/待办/重复指令）由对应计数变化决定，本工具只清显式标记。
+    """
+    conn = _get_conn(project)
+    try:
+        conn.execute(
+            "UPDATE situations SET frozen = NULL, frozen_at = NULL, updated_at = ? "
+            "WHERE project = ?",
+            (_now(), project),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    status = freeze_status(project)
+    if not status["frozen"]:
+        status["released_at"] = _now()
+    return status
+
+
 # ─── 核心逻辑 ──────────────────────────────────────────────────────
 
 def _cascade_invalidate(conn: sqlite3.Connection, parent_id: str):
@@ -1227,6 +1439,130 @@ async def list_tools() -> list[Tool]:
                 "required": ["project", "node_id"],
             },
         ),
+        # ── 监督层（v1.1 §3.6 E 组）──
+        Tool(
+            name="audit_violation",
+            description="""记录一条违规到审计日志（监督层，v1.1 §3.6）。
+
+规则编号（rule_id）:
+  R1 — 委派前未调 findings_search（无证据基线）
+  R2 — 同一假设连续失败≥2 仍继续
+  R3 — 汇报结论未附置信度
+  R4 — 委派 context 未附验证要求
+  R5 — 冻结触发（freeze_trigger 自动记录，一般无需手动调用）
+
+违规计数 ≥3 时 freeze_status 将返回 frozen=true。记录带自增 id，
+可用 audit_list / audit_stats 查询。
+
+参数:
+  project — 项目名
+  actor   — 违规方标识（'parent' 或 'agent:<id>'）
+  rule_id — 规则编号 R1-R5
+  detail  — 违规详情描述""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "项目名"},
+                    "actor": {"type": "string", "description": "违规方标识（parent 或 agent:<id>）"},
+                    "rule_id": {"type": "string", "enum": ["R1", "R2", "R3", "R4", "R5"], "description": "规则编号"},
+                    "detail": {"type": "string", "description": "违规详情描述"},
+                },
+                "required": ["project", "actor", "rule_id", "detail"],
+            },
+        ),
+        Tool(
+            name="audit_list",
+            description="""列出审计日志，按创建时间倒序（监督层，v1.1 §3.6）。
+
+参数:
+  project — 项目名
+  rule_id — 按规则编号过滤（可选，如 'R1'）
+  limit   — 返回上限（默认50）""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "项目名"},
+                    "rule_id": {"type": "string", "description": "规则编号过滤（可选）"},
+                    "limit": {"type": "integer", "default": 50, "minimum": 1, "maximum": 200},
+                },
+                "required": ["project"],
+            },
+        ),
+        Tool(
+            name="audit_stats",
+            description="""审计统计：按规则分组的违规计数 + 最近 5 条记录摘要（监督层，v1.1 §3.6）。
+
+响应: {"by_rule": {"R1": N, ...}, "total": N, "recent": [{id, rule_id, detail, created_at}]}
+
+参数:
+  project — 项目名""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "项目名"},
+                },
+                "required": ["project"],
+            },
+        ),
+        Tool(
+            name="freeze_status",
+            description="""冻结状态检查（监督层，v1.1 §3.6）。父 Agent 委派新方向前可调用。
+
+任一条件满足即 frozen=true：
+  - 显式冻结：situations.frozen 非空（freeze_trigger 写入）
+  - 违规计数 ≥3（audit_log 记录数）
+  - 未解决待办 ≥3（directives.status != 'resolved'）
+  - 存在 repeat_count ≥2 的指令（重复指令需用户决策）
+
+frozen=false 时 reason 为空列表。响应:
+  {"frozen": bool, "reason": ["触发条件..."], "counts": {"violations": N, "unresolved_directives": N, "repeated_directives": N}}
+
+参数:
+  project — 项目名""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "项目名"},
+                },
+                "required": ["project"],
+            },
+        ),
+        Tool(
+            name="freeze_trigger",
+            description="""显式冻结项目（监督层，v1.1 §3.6）：
+写入 situations.frozen（冻结原因）+ frozen_at，并自动在 audit_log 记一条 R5 违规（actor=parent）。
+
+响应: {"frozen": true, "reason": [...], "counts": {...}, "frozen_at": "..."}
+
+参数:
+  project — 项目名
+  reason  — 冻结原因（如 "连续 3 次同假设失败，需用户决策"）""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "项目名"},
+                    "reason": {"type": "string", "description": "冻结原因"},
+                },
+                "required": ["project", "reason"],
+            },
+        ),
+        Tool(
+            name="freeze_release",
+            description="""解除显式冻结（监督层，v1.1 §3.6）：清空 situations.frozen/frozen_at。
+
+自动触发的冻结（违规计数/未解决待办/重复指令）解除条件由对应计数变化决定，
+本工具只清除显式冻结标记。响应: {"frozen": false, "reason": [], "counts": {...}, "released_at": "..."}
+
+参数:
+  project — 项目名""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "项目名"},
+                },
+                "required": ["project"],
+            },
+        ),
     ]
 
 
@@ -1317,6 +1653,42 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 project=arguments["project"],
                 node_id=arguments["node_id"],
             )
+            return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+
+        elif name == "audit_violation":
+            result = audit_violation(
+                project=arguments["project"],
+                actor=arguments["actor"],
+                rule_id=arguments["rule_id"],
+                detail=arguments["detail"],
+            )
+            return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+
+        elif name == "audit_list":
+            result = audit_list(
+                project=arguments["project"],
+                rule_id=arguments.get("rule_id"),
+                limit=arguments.get("limit", 50),
+            )
+            return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+
+        elif name == "audit_stats":
+            result = audit_stats(project=arguments["project"])
+            return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+
+        elif name == "freeze_status":
+            result = freeze_status(project=arguments["project"])
+            return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+
+        elif name == "freeze_trigger":
+            result = freeze_trigger(
+                project=arguments["project"],
+                reason=arguments["reason"],
+            )
+            return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+
+        elif name == "freeze_release":
+            result = freeze_release(project=arguments["project"])
             return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
 
         else:
