@@ -177,6 +177,16 @@ def _migrate_schema(conn: sqlite3.Connection):
         conn.execute("ALTER TABLE tree_nodes ADD COLUMN markers_json TEXT NOT NULL DEFAULT '[]'")
     conn.commit()
 
+    # ── 迁移 5：situations 表添加 project_meta_json 列（v1.1-batch1）──
+    # situations 表由 _get_conn_inner 的 CREATE TABLE IF NOT EXISTS 负责新建，此处只做
+    # 「旧库首连升级」：已存在但缺列的 situations 表补 project_meta_json（慢变元信息槽位）。
+    situation_cols = {r[1] for r in conn.execute("PRAGMA table_info(situations)").fetchall()}
+    if situation_cols and "project_meta_json" not in situation_cols:
+        conn.execute(
+            "ALTER TABLE situations ADD COLUMN project_meta_json TEXT NOT NULL DEFAULT '{}'"
+        )
+    conn.commit()
+
     # P0 审查修复：迁移完成后恢复外键约束（迁移 1 期间关闭以容纳旧库 dangling based_on；
     # 此句在最后一次 commit 之后执行，无挂起事务，PRAGMA 生效）
     conn.execute("PRAGMA foreign_keys=ON")
@@ -251,6 +261,7 @@ def _get_conn_inner(db_path) -> sqlite3.Connection:
     conn.execute("CREATE TABLE IF NOT EXISTS situations ("
         "project        TEXT PRIMARY KEY,"
         "objective      TEXT NOT NULL DEFAULT '',"
+        "project_meta_json TEXT NOT NULL DEFAULT '{}',"
         "progress_json  TEXT NOT NULL DEFAULT '[]',"
         "active_work_json TEXT NOT NULL DEFAULT '{}',"
         "conflict_queue_json TEXT NOT NULL DEFAULT '[]',"
@@ -910,6 +921,7 @@ _RENDER_SIZE_LIMIT = 6000
 
 # situations JSON 列 → 局面对象键名
 _SITUATION_JSON_COLS = [
+    ("project_meta_json", "project_meta"),
     ("progress_json", "progress"),
     ("active_work_json", "active_work"),
     ("conflict_queue_json", "conflict_queue"),
@@ -918,6 +930,9 @@ _SITUATION_JSON_COLS = [
     ("user_directives_json", "user_directives"),
     ("timeline_json", "timeline"),
 ]
+
+# dict 型 JSON 列（空值时回退 {}，其余列回退 []）
+_SITUATION_DICT_COLS = {"project_meta_json", "active_work_json"}
 
 
 def _truncate(s: str, n: int = 60) -> str:
@@ -944,6 +959,7 @@ def situation_get(project: str) -> dict:
         return {
             "project": project,
             "objective": "",
+            "project_meta": {},
             "progress": [],
             "active_work": {},
             "conflict_queue": [],
@@ -960,16 +976,19 @@ def situation_get(project: str) -> dict:
     d = _row_to_dict(row)
     for col, key in _SITUATION_JSON_COLS:
         raw = d.pop(col, None)
-        d[key] = json.loads(raw) if raw else ({} if col == "active_work_json" else [])
+        d[key] = json.loads(raw) if raw else ({} if col in _SITUATION_DICT_COLS else [])
     return d
 
 
 def situation_update(project: str, objective: str | None = None,
+                     project_meta: dict | None = None,
                      progress: list | None = None, active_work: dict | None = None,
                      candidate_directions: list | None = None, risks: list | None = None,
                      timeline_event: dict | None = None) -> dict:
     """更新项目局面对象（v1.1 §3.3）。
 
+    - project_meta 为慢变元信息（workdir/repo/engine/api/background 等约定结构），整体覆盖存储，
+      不传不覆盖（与 objective 语义一致）
     - 各列表字段 json 序列化存储；timeline_event={event, actor} 追加进 timeline（time 服务端补 _now()）
     - version 每次 +1；表无行时先 INSERT 新行（objective 默认 ''），有行时 UPDATE
     - 校验：candidate_directions 每项必须含 evidence_strength ∈ {high,mid,low}，缺失拒绝；
@@ -977,7 +996,7 @@ def situation_update(project: str, objective: str | None = None,
     - P1b 审查修复：无任何有效字段（全部 None）→ 返回原状、不建行、不 bump version
       （原实现空参数调用也 version+1，与 freeze_trigger 的写操作语义不一致）
     """
-    if all(v is None for v in (objective, progress, active_work,
+    if all(v is None for v in (objective, project_meta, progress, active_work,
                                candidate_directions, risks, timeline_event)):
         return situation_get(project)
     conn = _get_conn(project)
@@ -994,6 +1013,10 @@ def situation_update(project: str, objective: str | None = None,
                 "SELECT * FROM situations WHERE project = ?", (project,)
             ).fetchone()
         cur = _row_to_dict(row)
+
+        # 校验：project_meta 必须是 dict（慢变元信息，整体覆盖）
+        if project_meta is not None and not isinstance(project_meta, dict):
+            raise ValueError(f"project_meta must be a dict, got {type(project_meta).__name__}")
 
         # 校验：候选方向必须含 evidence_strength ∈ {high,mid,low}
         if candidate_directions is not None:
@@ -1043,6 +1066,8 @@ def situation_update(project: str, objective: str | None = None,
         updates: dict = {}
         if objective is not None:
             updates["objective"] = objective
+        if project_meta is not None:
+            updates["project_meta_json"] = json.dumps(project_meta, ensure_ascii=False)
         if progress is not None:
             updates["progress_json"] = json.dumps(progress, ensure_ascii=False)
         if active_work is not None:
@@ -1961,11 +1986,18 @@ def findings_snapshot(project: str, role: str = "discovery",
 
     - 非法 role → ValueError；项目无 finding → 空 snapshot
     - truncated 按 limit 是否达上限判断（查 limit+1 条）
+    - 返回附带 project_meta（从 situations.project_meta_json 读取，无局面行时为 {}），
+      供父 Agent 委派模板直接引用项目元信息，无需手写路径/引擎/背景
     """
     if role not in _SNAPSHOT_ROLES:
         raise ValueError(f"Invalid role: {role}. Must be one of {sorted(_SNAPSHOT_ROLES)}")
     conn = _get_conn(project)
     try:
+        meta_row = conn.execute(
+            "SELECT project_meta_json FROM situations WHERE project = ?", (project,)
+        ).fetchone()
+        project_meta = json.loads(meta_row["project_meta_json"]) if (
+            meta_row and meta_row["project_meta_json"]) else {}
         conditions = ["project = ?"]
         params = [project]
         if tree_node_id:
@@ -2012,7 +2044,8 @@ def findings_snapshot(project: str, role: str = "discovery",
                     if base:
                         item["based_on_fact"] = _truncate(base["fact"], 120)
             snapshot.append(item)
-        return {"role": role, "truncated": truncated, "snapshot": snapshot}
+        return {"role": role, "truncated": truncated, "snapshot": snapshot,
+                "project_meta": project_meta}
     finally:
         conn.close()
 
@@ -2543,6 +2576,40 @@ def get_finding(project: str, kid: str) -> dict | None:
     return result
 
 
+def delete_finding(project: str, kid: str) -> dict:
+    """删除单条发现（v1.1-batch1 #2）。
+
+    - 目标不存在（project+id）→ raise ValueError（与 findings_get not found 风格对齐，由 call_tool 捕获）
+    - DELETE knowledge 行：based_on FK ON DELETE SET NULL 自动置空依赖它的条目；
+      knowledge_ad FTS 触发器自动同步删除全文索引
+    - task_meta 无 FK 约束 → 手动 DELETE（type=task 的关联行一并清理）
+    - 返回 {deleted_id, orphaned_dependents}：orphaned_dependents = 依赖该条目的 finding 数
+      （它们的 based_on 已被 FK 置空，需调用方关注推理链断裂）
+
+    已知边界：conflicts 的 party_a_id/party_b_id 无 FK，删除后可能成悬空引用——
+    既有设计本无 finding 删除路径，冲突对象按 id 自包含 summary/evidence，此处不级联处理。
+    """
+    conn = _get_conn(project)
+    try:
+        existing = conn.execute(
+            "SELECT id FROM knowledge WHERE id = ? AND project = ?", (kid, project)
+        ).fetchone()
+        if not existing:
+            raise ValueError(f"Finding not found: {kid} (project={project})")
+
+        orphaned = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM knowledge WHERE based_on = ?", (kid,)
+        ).fetchone()["cnt"]
+
+        conn.execute("DELETE FROM task_meta WHERE finding_id = ?", (kid,))
+        conn.execute("DELETE FROM knowledge WHERE id = ?", (kid,))
+        conn.commit()
+    finally:
+        conn.close()
+
+    return {"deleted_id": kid, "orphaned_dependents": orphaned}
+
+
 def update_finding(project: str, kid: str, fact: str | None = None,
                    confidence: str | None = None, evidence: str | None = None,
                    tags: list[str] | None = None,
@@ -2813,6 +2880,28 @@ async def list_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="findings_delete",
+            description="""删除单条发现（v1.1-batch1 #2）。用于纠正误写/幽灵库残留。
+
+删除副作用：
+  - 依赖它的条目（based_on 指向它）的 based_on 被自动置 NULL（FK ON DELETE SET NULL），
+    返回 orphaned_dependents 告知数量
+  - type=task 的 task_meta 关联行一并清理；全文索引（FTS）自动同步删除
+  - 不可恢复，删除前建议先 findings_get 确认目标
+
+参数:
+  project — 项目名
+  id      — finding ID""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string"},
+                    "id": {"type": "string"},
+                },
+                "required": ["project", "id"],
+            },
+        ),
+        Tool(
             name="tree_store",
             description="""创建或更新树节点。自动创建路径上所有缺失的中间节点。
 
@@ -3042,9 +3131,9 @@ frozen=false 时 reason 为空列表。响应:
             name="situation_get",
             description="""获取项目局面对象（状态层，v1.1 §3.3）。
 
-响应: {project, objective, progress, active_work, conflict_queue, candidate_directions,
+响应: {project, objective, project_meta, progress, active_work, conflict_queue, candidate_directions,
 risks, user_directives, timeline, version, frozen, frozen_at, updated_at}
-无局面记录时返回默认空局面（objective=''、各列表=[]、version=1、frozen=null），不自动建行。
+无局面记录时返回默认空局面（objective=''、project_meta={}、各列表=[]、version=1、frozen=null），不自动建行。
 
 参数:
   project — 项目名""",
@@ -3060,6 +3149,7 @@ risks, user_directives, timeline, version, frozen, frozen_at, updated_at}
             name="situation_update",
             description="""更新项目局面对象（状态层，v1.1 §3.3）。
 
+- project_meta 为慢变元信息（约定结构 {workdir, repo, engine, api, background}），整体覆盖，不传不覆盖
 - 各列表字段 json 序列化存储；timeline_event={event, actor} 追加进 timeline（time 服务端补）
 - version 每次 +1；无局面记录时自动建行（objective 默认 ''）
 - 校验：candidate_directions 每项必须含 evidence_strength ∈ {high,mid,low}，缺失拒绝
@@ -3067,6 +3157,7 @@ risks, user_directives, timeline, version, frozen, frozen_at, updated_at}
 参数:
   project             — 项目名
   objective           — 当前目标（可选）
+  project_meta        — 慢变元信息 dict（可选，如 {workdir, repo, engine, api, background}）
   progress            — 已完成摘要列表 [{id, summary, confidence}]（id 引用不存在的 finding 时降级为纯文本）
   active_work         — 活跃工作对象 {agent, task, last_heartbeat}
   candidate_directions— 候选方向列表 [{direction, evidence_strength}]（evidence_strength 必填）
@@ -3077,6 +3168,7 @@ risks, user_directives, timeline, version, frozen, frozen_at, updated_at}
                 "properties": {
                     "project": {"type": "string", "description": "项目名"},
                     "objective": {"type": "string", "description": "当前目标"},
+                    "project_meta": {"type": "object", "description": "慢变元信息 dict（workdir/repo/engine/api/background 等）"},
                     "progress": {"type": "array", "items": {"type": "object"}, "description": "已完成摘要列表"},
                     "active_work": {"type": "object", "description": "活跃工作 {agent, task, last_heartbeat}"},
                     "candidate_directions": {"type": "array", "items": {"type": "object"}, "description": "候选方向 [{direction, evidence_strength}]"},
@@ -3456,7 +3548,8 @@ verified=false → 仅记录到返回的 mismatches（不自动生成 conflict�
   judge            — 完整字段 + evidence_uri（若存在，指向原始工具输出）
   analyst          — 完整字段 + based_on 展开（引用 finding 的 fact 内联为 based_on_fact）
 
-返回 {role, truncated, snapshot}；truncated 表示已达 limit 上限被截断；非法 role 拒绝。
+返回 {role, truncated, snapshot, project_meta}；truncated 表示已达 limit 上限被截断；
+project_meta 从局面对象读取（无局面行时为 {}），供委派模板引用项目元信息；非法 role 拒绝。
 
 参数:
   project       — 项目名
@@ -3591,6 +3684,13 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             )
             return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
 
+        elif name == "findings_delete":
+            result = delete_finding(
+                project=arguments["project"],
+                kid=arguments["id"],
+            )
+            return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+
         elif name == "tree_store":
             result = tree_store(
                 project=arguments["project"],
@@ -3673,6 +3773,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             result = situation_update(
                 project=arguments["project"],
                 objective=arguments.get("objective"),
+                project_meta=arguments.get("project_meta"),
                 progress=arguments.get("progress"),
                 active_work=arguments.get("active_work"),
                 candidate_directions=arguments.get("candidate_directions"),
