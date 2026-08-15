@@ -61,6 +61,25 @@ CREATE TABLE tree_nodes (
 );
 """
 
+# v1.1 旧版 situations 表（缺 project_meta_json 列，batch1 前）
+_V11_SITUATIONS_SQL = """
+CREATE TABLE situations (
+    project        TEXT PRIMARY KEY,
+    objective      TEXT NOT NULL DEFAULT '',
+    progress_json  TEXT NOT NULL DEFAULT '[]',
+    active_work_json TEXT NOT NULL DEFAULT '{}',
+    conflict_queue_json TEXT NOT NULL DEFAULT '[]',
+    candidate_directions_json TEXT NOT NULL DEFAULT '[]',
+    risks_json     TEXT NOT NULL DEFAULT '[]',
+    user_directives_json TEXT NOT NULL DEFAULT '[]',
+    timeline_json  TEXT NOT NULL DEFAULT '[]',
+    version        INTEGER NOT NULL DEFAULT 1,
+    frozen         TEXT,
+    frozen_at      TEXT,
+    updated_at     TEXT NOT NULL DEFAULT (datetime('now'))
+);
+"""
+
 # v1.1 新库应包含的 8 张核心表
 _CORE_TABLES = {
     "knowledge", "tree_nodes", "situations", "directives",
@@ -243,6 +262,38 @@ class TestV2EraMigration(harness.HarnessTestCase):
         res = self.mod.search_findings("v2", query="sub_4012a0", use_fts=True)
         self.assertEqual(len(res), 1, "v2 旧数据应保留且 FTS 回填")
         self.assertEqual(res[0]["id"], "v1")
+
+
+class TestBatch1SituationsMigration(harness.HarnessTestCase):
+    """batch1 旧库（situations 缺 project_meta_json）→ 迁移 5 补列带默认值 + 数据保留。"""
+
+    def setUp(self):
+        super().setUp()
+        db_path = os.path.join(self.tmp, "v11.db")
+        conn = sqlite3.connect(db_path)
+        conn.executescript(_V2_KNOWLEDGE_SQL + _V2_TREE_NODES_SQL + _V11_SITUATIONS_SQL)
+        conn.execute(
+            "INSERT INTO situations (project, objective) VALUES ('v11', 'old objective')")
+        conn.commit()
+        conn.close()
+
+    def test_project_meta_json_column_added_with_default(self):
+        conn = self.mod._get_conn("v11")
+        try:
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(situations)")}
+            self.assertIn("project_meta_json", cols, "迁移 5 应补 project_meta_json 列")
+            row = conn.execute(
+                "SELECT project_meta_json, objective FROM situations WHERE project='v11'"
+            ).fetchone()
+            self.assertEqual(row["project_meta_json"], "{}", "旧行补默认 '{}'")
+            self.assertEqual(row["objective"], "old objective", "迁移保留原数据")
+        finally:
+            conn.close()
+
+    def test_situation_get_parses_migrated_meta(self):
+        s = self.mod.situation_get("v11")
+        self.assertEqual(s["project_meta"], {}, "迁移后旧局面读回 project_meta={}")
+        self.assertEqual(s["objective"], "old objective")
 
 
 if __name__ == "__main__":
