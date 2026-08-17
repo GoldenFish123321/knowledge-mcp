@@ -52,6 +52,34 @@ class TestSituation(harness.HarnessTestCase):
         s2 = self.mod.situation_update(self.p, objective="solve it harder")
         self.assertEqual(s2["version"], 3)
 
+    def test_project_meta_roundtrip_and_merge_semantics(self):
+        # 默认空局面 project_meta = {}
+        self.assertEqual(self.mod.situation_get(self.p)["project_meta"], {})
+        meta = {"workdir": "/workspace/x", "repo": "https://github.com/a/b",
+                "engine": "gdb", "api": "openai", "background": "RE 挑战"}
+        s = self.mod.situation_update(self.p, project_meta=meta)
+        self.assertEqual(s["project_meta"], meta, "整体覆盖写入后读回一致")
+        # 不传 project_meta → 不覆盖（只改 objective）
+        s2 = self.mod.situation_update(self.p, objective="keep meta")
+        self.assertEqual(s2["project_meta"], meta, "不传 project_meta 时保留原值")
+        # 整体覆盖：传新 dict 替换旧 dict
+        s3 = self.mod.situation_update(self.p, project_meta={"workdir": "/new"})
+        self.assertEqual(s3["project_meta"], {"workdir": "/new"}, "传 dict 整体覆盖")
+
+    def test_project_meta_non_dict_rejected(self):
+        with self.assertRaises(ValueError):
+            self.mod.situation_update(self.p, project_meta=["not", "a", "dict"])
+        with self.assertRaises(ValueError):
+            self.mod.situation_update(self.p, project_meta="workdir=/x")
+        # 非法值不落库：仍为空
+        self.assertEqual(self.mod.situation_get(self.p)["project_meta"], {})
+
+    def test_project_meta_noop_when_all_none(self):
+        # 全 None → 不建行、不 bump version（既有 P1b 语义），project_meta 同样遵循
+        s = self.mod.situation_update(self.p)
+        self.assertEqual(s["version"], 1, "全 None 不建行不 bump")
+        self.assertEqual(s["project_meta"], {})
+
     def test_candidate_directions_evidence_strength_validation(self):
         with self.assertRaises(ValueError):
             self.mod.situation_update(self.p, candidate_directions=[
@@ -394,6 +422,83 @@ class TestSnapshot(harness.HarnessTestCase):
         r = self.mod.findings_snapshot(self.p, role="discovery", limit=2)
         self.assertTrue(r["truncated"])
         self.assertEqual(len(r["snapshot"]), 2)
+
+    def test_project_meta_injected(self):
+        # 无局面行 → project_meta = {}
+        r0 = self.mod.findings_snapshot(self.p, role="discovery")
+        self.assertEqual(r0["project_meta"], {})
+        # 写入局面元信息后 → snapshot 附带
+        meta = {"workdir": "/w", "repo": "r", "engine": "ida", "background": "bg"}
+        self.mod.situation_update(self.p, project_meta=meta)
+        r1 = self.mod.findings_snapshot(self.p, role="judge")
+        self.assertEqual(r1["project_meta"], meta, "snapshot 注入 project_meta 供委派模板引用")
+        # 各角色裁剪均不影响 project_meta 字段
+        self.assertEqual(self.mod.findings_snapshot(self.p, role="analyst")["project_meta"], meta)
+
+
+class TestFindingDelete(harness.HarnessTestCase):
+    def setUp(self):
+        super().setUp()
+        self.p = "ops_del"
+
+    def test_delete_basic_and_not_found(self):
+        kid = seed_observation(self.mod, self.p, fact="to delete")
+        r = self.mod.delete_finding(self.p, kid)
+        self.assertEqual(r["deleted_id"], kid)
+        self.assertEqual(r["orphaned_dependents"], 0)
+        self.assertIsNone(self.mod.get_finding(self.p, kid), "删除后 get 返回 None")
+        # 再次删除 → 抛错（目标不存在）
+        with self.assertRaises(ValueError):
+            self.mod.delete_finding(self.p, kid)
+        # 跨项目 id 不存在 → 抛错（project 维度隔离）
+        with self.assertRaises(ValueError):
+            self.mod.delete_finding("other_project", kid)
+
+    def test_delete_orphans_dependents_via_fk(self):
+        # 链：observation → claim based_on 它
+        obs = seed_observation(self.mod, self.p, fact="base obs")
+        claim = self.mod.store_finding(
+            project=self.p, fact="claim depends on base", confidence="confirmed-inferred",
+            source=PARENT, type_="claim", based_on=obs,
+            evidence="agent:alpha 复核一致；agent:beta 复核一致")
+        r = self.mod.delete_finding(self.p, obs)
+        self.assertEqual(r["orphaned_dependents"], 1)
+        dep = self.mod.get_finding(self.p, claim["id"])
+        self.assertIsNone(dep["based_on"], "FK ON DELETE SET NULL 自动置空 based_on")
+        # 目标 observation 已删除
+        self.assertIsNone(self.mod.get_finding(self.p, obs))
+
+    def test_delete_cleans_task_meta(self):
+        # type=task 写 task_meta → 删除后 task_meta 一并清理
+        task = self.mod.store_finding(
+            project=self.p, fact="task: do x", confidence="likely", source=SUB,
+            type_="task", task_budget={"budget_tool_calls": 5, "budget_tokens": 100,
+                                        "budget_seconds": 30})
+        conn = self.mod._get_conn(self.p)
+        try:
+            n_before = conn.execute(
+                "SELECT COUNT(*) FROM task_meta WHERE finding_id = ?", (task["id"],)
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(n_before, 1, "task finding 落 task_meta")
+        self.mod.delete_finding(self.p, task["id"])
+        conn = self.mod._get_conn(self.p)
+        try:
+            n_after = conn.execute(
+                "SELECT COUNT(*) FROM task_meta WHERE finding_id = ?", (task["id"],)
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(n_after, 0, "删除后 task_meta 关联行清理")
+
+    def test_delete_syncs_fts_index(self):
+        # FTS 触发器同步删除：删除后 use_fts 搜索不应再命中
+        kid = seed_observation(self.mod, self.p, fact="unique fts deletion marker")
+        self.assertEqual(len(self.mod.search_findings(self.p, query="deletion marker", use_fts=True)), 1)
+        self.mod.delete_finding(self.p, kid)
+        self.assertEqual(len(self.mod.search_findings(self.p, query="deletion marker", use_fts=True)), 0,
+                         "FTS 索引同步删除，搜索不再命中")
 
 
 class TestArtifact(harness.HarnessTestCase):

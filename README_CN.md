@@ -165,6 +165,14 @@ v1.1 新增参数：`evidence_uri`（新的 artifact:// URI，不传不覆盖）
 - 所有 `based_on` 指向此 ID 的条目 → 降级为 `speculative` + 追加 `invalidated` 标签
 - 递归处理二级依赖
 
+#### findings_delete — 删除（纠正误写/幽灵库残留）
+
+删除单条发现，返回 `{deleted_id, orphaned_dependents}`。删除副作用：
+
+- 依赖它的条目（`based_on` 指向它）的 `based_on` 被自动置 NULL（FK ON DELETE SET NULL），`orphaned_dependents` 告知数量
+- `type=task` 的 `task_meta` 关联行一并清理；全文索引（FTS）自动同步删除
+- 不可恢复，删除前建议先 `findings_get` 确认目标；目标不存在（project+id 不匹配）拒绝
+
 #### tree_store / tree_get / tree_search / tree_delete — 树结构
 
 - **tree_store** — 创建/更新树节点：`path`（`>` 分隔层级）+ `node_type`（project|file|function|class|section）+ `parent_path`（可选，拼接前缀）。自动创建缺失中间节点
@@ -202,8 +210,8 @@ v1.1 新增参数：`evidence_uri`（新的 artifact:// URI，不传不覆盖）
 
 | 工具 | 一句话说明 | 关键参数 |
 |------|-----------|---------|
-| `situation_get` | 获取项目局面对象（objective/progress/active_work/conflict_queue/candidate_directions/risks/timeline/version/frozen）；无记录返回默认空局面，不自动建行 | `project` |
-| `situation_update` | 更新局面：version 每次 +1，timeline_event 追加，candidate_directions 每项必须含 evidence_strength∈{high,mid,low} | `project` + 各局面字段 |
+| `situation_get` | 获取项目局面对象（objective/project_meta/progress/active_work/conflict_queue/candidate_directions/risks/timeline/version/frozen）；无记录返回默认空局面（project_meta={}），不自动建行 | `project` |
+| `situation_update` | 更新局面：version 每次 +1，timeline_event 追加，candidate_directions 每项必须含 evidence_strength∈{high,mid,low}；project_meta 为慢变元信息（约定 {workdir, repo, engine, api, background}），整体覆盖、不传不覆盖 | `project` + 各局面字段 |
 | `situation_report` | 生成局面推送文本（📊/✅/🔄/⚠️/🎯/📌 行格式），可直接推送给用户 | `project` |
 | `tree_mark` | 给树节点加状态标记（conflict/active/disproved/candidate/directive/unverified），去重 | `node_id`、`marker` |
 | `tree_unmark` | 移除节点标记（无副作用） | `node_id`、`marker` |
@@ -280,7 +288,7 @@ D3CTF2026_d3llvm
 
 | 工具 | 一句话说明 | 关键参数 |
 |------|-----------|---------|
-| `findings_snapshot` | 按角色裁剪的 findings 快照：discovery 仅 id+fact+confidence+type（防锚定）；detector 完整字段；judge 加 evidence_uri；analyst 加 based_on 展开（based_on_fact） | `role`、`tree_node_id`、`limit` |
+| `findings_snapshot` | 按角色裁剪的 findings 快照：discovery 仅 id+fact+confidence+type（防锚定）；detector 完整字段；judge 加 evidence_uri；analyst 加 based_on 展开（based_on_fact）。返回附带 `project_meta`（从局面对象读取，无局面行为 {}），供委派模板直接引用项目元信息 | `role`、`tree_node_id`、`limit` |
 | `project_list` | 项目总览：列出 DB_DIR 下所有项目 + findings_count/tree_nodes_count/updated_at | 无参数 |
 | `artifact_store` | 原始工具输出落盘：写入 DB_DIR/artifacts/<project>/<sha1>.txt，返回 artifact:// URI 供 evidence_uri 引用；超 512KB 截断标记 truncated | `tool`、`command`、`output` |
 | `artifact_get` | 按 artifact:// URI 取回原始输出（裁决型用） | `uri` |
@@ -316,7 +324,7 @@ artifact://tool_output/<project>/<sha1>.txt
 |----|------|
 | `knowledge` | 发现主表（fact/confidence/source/evidence/based_on/tags/tree_node_id/**type**/**evidence_uri**/invalidation_reason） |
 | `tree_nodes` | 树节点表（自引用层级 + status/markers_json） |
-| `situations` | 局面对象（每项目一行：objective/progress/active_work/conflict_queue/candidate_directions/risks/user_directives/timeline/version/frozen） |
+| `situations` | 局面对象（每项目一行：objective/**project_meta_json**/progress/active_work/conflict_queue/candidate_directions/risks/user_directives/timeline/version/frozen） |
 | `directives` | 用户指令待办（type/status/anchor/repeat_count/resolved_at） |
 | `conflicts` | 冲突记录（状态机 pending→under_review→adjudicated/resolved_by_rerun + strategy/resolution） |
 | `audit_log` | 监督审计日志（rule_id/actor/detail，违规计数驱动冻结） |
