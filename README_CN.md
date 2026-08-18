@@ -5,11 +5,12 @@
 > 轻量级 Agent 推理发现存储 MCP 工具 — 带可信度标注、推理链追溯、级联降级、冲突检测。
 > 同时支持 **DAG 推理链**和**树状项目结构**两个维度组织信息。
 > 专为 CTF 逆向多 Agent 工作流设计，区分观察与推断，防止幻觉级联。
-> v1.1 新增：监督层（审计/冻结）、状态层（局面/树标记）、指挥层（指令待办）、冲突存储、快照裁剪与 artifact 证据存储，共 **36 个 MCP 工具**。
+> v1.1 新增：监督层（审计/冻结）、状态层（局面/树标记）、指挥层（指令待办）、冲突存储、快照裁剪与 artifact 证据存储，共 **37 个 MCP 工具**。
 
 [English docs / 英文文档](README.md)
 
 ---
+
 
 ## 设计理念
 
@@ -75,7 +76,7 @@ Agent 每完成一步推理，记录一条发现。核心价值：
 
 ## 写库 gate（v1.1 角色权责）
 
-findings_store / findings_update 落库前做**四层结构校验**（只做结构不做语义）：
+findings_store / findings_update 落库前做**五层结构校验**（只做结构不做语义）：
 
 | 层 | 规则 | 失败示例 |
 |----|------|---------|
@@ -83,26 +84,27 @@ findings_store / findings_update 落库前做**四层结构校验**（只做结�
 | ② type 校验 | `claim` 必须 based_on 非空、ID 存在、且该 finding type=observation；`hypothesis` 的 fact 必须含 `test_plan:`；`task` 必须 task_budget 含 budget_tool_calls/budget_tokens/budget_seconds 三字段；type 非枚举 → 拒绝 | `hypothesis` 无 test_plan → 拒绝 |
 | ③ 交叉验证标记 | `confirmed-inferred` 的 evidence 必须含 ≥2 个不同 `agent:<id>` 标记 | 只有 1 个 agent 标记 → 拒绝 |
 | ④ 只结构不语义 | 服务端不判断事实真假，语义匹配归检测型子 Agent | — |
+| ⑤ project 绑定（batch2 #1） | 父 Agent 通过 `situation_update` / `directive_create` **激活活动项目**后，子 Agent `findings_store`/`findings_update` 写入其他项目 → 拒绝。未激活 → 放行（兼容旧流程）；role=parent / role 无法解析 → 豁免。活动项目存全局 `_app_state.db`（非项目库），**单活动项目模型**——父 Agent 并行派子 Agent 到不同项目时后激活者生效，需串行切换编排（P2-7） | 激活 `projA` 后子 Agent 写 `projB` → `write_gate_violation` |
 
 失败响应：`{"error": "write_gate_violation: <原因> | suggestion: <建议>"}`。
 update 版 gate 只校验 ① + ③（type 在 store 时已校验），且仅在显式改受限置信度时触发（补证据/改标签不误拒）。
 
 ---
 
-## MCP 工具（36 个）
+## MCP 工具（37 个）
 
 ### 分组总览
 
 | 分组 | 工具 | 作用 |
 |------|------|------|
-| **基础 8** | findings_store / search / get / update + tree_store / get / search / delete | 证据存储、搜索、树结构 |
+| **基础 9** | findings_store / search / get / update / delete + tree_store / get / search / delete | 证据存储、搜索、树结构 |
 | **G1 监督层 6** | audit_violation / list / stats + freeze_status / trigger / release | 违规审计 + 冻结状态机 |
 | **G2 状态层 6** | situation_get / update / report + tree_mark / unmark / render | 局面对象 + 树标记 + 树渲染 |
 | **G3 指挥层 6** | directive_create / list / update / repeat / parse + preflight_check | 用户指令待办 + 委派前检查 |
 | **G4 冲突存储 6** | conflict_report / list / update / stats + verification_check / report | 冲突状态机 + 回归抽样 |
 | **G5 快照裁剪 4** | findings_snapshot / project_list / artifact_store / get | 角色裁剪快照 + artifact 证据库 |
 
-### 基础 8 个
+### 基础 9 个
 
 #### findings_store — 存储发现
 
@@ -211,7 +213,7 @@ v1.1 新增参数：`evidence_uri`（新的 artifact:// URI，不传不覆盖）
 | 工具 | 一句话说明 | 关键参数 |
 |------|-----------|---------|
 | `situation_get` | 获取项目局面对象（objective/project_meta/progress/active_work/conflict_queue/candidate_directions/risks/timeline/version/frozen）；无记录返回默认空局面（project_meta={}），不自动建行 | `project` |
-| `situation_update` | 更新局面：version 每次 +1，timeline_event 追加，candidate_directions 每项必须含 evidence_strength∈{high,mid,low}；project_meta 为慢变元信息（约定 {workdir, repo, engine, api, background}），整体覆盖、不传不覆盖 | `project` + 各局面字段 |
+| `situation_update` | 更新局面：version 每次 +1，timeline_event 追加，candidate_directions 每项必须含 evidence_strength∈{high,mid,low}；project_meta 为慢变元信息（约定 {workdir, repo, engine, api, background}），整体覆盖、不传不覆盖。**batch2 #6**：`progress_append` / `candidate_directions_append` 追加到现有列表末尾（空列表=无操作；与覆盖版同时传时先覆盖后追加）。副作用：激活/切换活动项目（见写库 gate ⑤） | `project` + 各局面字段 |
 | `situation_report` | 生成局面推送文本（📊/✅/🔄/⚠️/🎯/📌 行格式），可直接推送给用户 | `project` |
 | `tree_mark` | 给树节点加状态标记（conflict/active/disproved/candidate/directive/unverified），去重 | `node_id`、`marker` |
 | `tree_unmark` | 移除节点标记（无副作用） | `node_id`、`marker` |

@@ -5,11 +5,12 @@
 > Lightweight agent reasoning findings store — confidence labeling, reasoning chains, cascade invalidation, conflict detection.
 > Dual-dimensional organization: **DAG** (reasoning chain) + **Tree** (project structure).
 > Designed for CTF reverse engineering multi-agent workflows: separates observation from inference, prevents hallucination cascade.
-> v1.1 adds supervision (audit/freeze), situation state, directive backlog, conflict storage, snapshots & artifact evidence — **36 MCP tools** in total.
+> v1.1 adds supervision (audit/freeze), situation state, directive backlog, conflict storage, snapshots & artifact evidence — **37 MCP tools** in total.
 
 [中文文档 / Chinese docs](README_CN.md) — full documentation (Chinese)
 
 ---
+
 
 ## Design Philosophy
 
@@ -57,32 +58,33 @@ Each finding participates in two orthogonal structures:
 
 ## Write Gate (v1.1 role authority)
 
-`findings_store` / `findings_update` run 4-layer structural validation before writing:
+`findings_store` / `findings_update` run 5-layer structural validation before writing:
 
 1. **Role authority** — `role:xxx` in `source`. Sub-agents (discovery/detector/judge/analyst/leaf) may NOT mark `confirmed-inferred`/`speculative`; `role=parent` allowed; **missing/unparseable role → rejected** (strict by default). confirmed-observed/likely/disproved are never role-gated.
 2. **Type validation** — `claim` requires non-empty `based_on` pointing to an existing `observation`; `hypothesis` fact must contain `test_plan:`; `task` requires `task_budget` (budget_tool_calls/budget_tokens/budget_seconds); non-enum type rejected.
 3. **Cross-validation markers** — `confirmed-inferred` evidence must contain ≥2 distinct `agent:<id>` markers.
 4. **Structure only, never semantics** — semantic matching belongs to detection sub-agents.
+5. **Project binding (batch2 #1)** — after the parent agent activates a project (via `situation_update` / `directive_create`), sub-agent `findings_store` writes to any other project are rejected with `write_gate_violation`. Fail-open when no project is active (backward compatible); `role=parent` and unparseable roles are exempt. Active project is stored in the global `_app_state.db` (not per-project DBs).
 
 Failure: `{"error": "write_gate_violation: <reason> | suggestion: <suggestion>"}`.
 The update gate validates only ① + ③, and only when explicitly raising to a gated confidence (adding evidence/tags never misfires).
 
 ---
 
-## MCP Tools (36)
+## MCP Tools (37)
 
 ### Group Overview
 
 | Group | Tools | Purpose |
 |-------|-------|---------|
-| **Core 8** | findings_store / search / get / update + tree_store / get / search / delete | Evidence storage, search, tree structure |
+| **Core 9** | findings_store / search / get / update / delete + tree_store / get / search / delete | Evidence storage, search, tree structure |
 | **G1 Supervision 6** | audit_violation / list / stats + freeze_status / trigger / release | Violation audit + freeze state machine |
 | **G2 Situation 6** | situation_get / update / report + tree_mark / unmark / render | Situation object + tree markers + tree rendering |
 | **G3 Command 6** | directive_create / list / update / repeat / parse + preflight_check | User directive backlog + pre-delegation check |
 | **G4 Conflict 6** | conflict_report / list / update / stats + verification_check / report | Conflict state machine + regression sampling |
 | **G5 Snapshot 4** | findings_snapshot / project_list / artifact_store / get | Role-trimmed snapshots + artifact evidence store |
 
-### Core 8
+### Core 9
 
 - **findings_store** — store a finding. v1.1 params: `type` (observation|claim|hypothesis|task, default claim; task writes task_meta), `evidence_uri` (artifact:// URI), `tree_path` (auto-creates tree nodes). Auto conflict detection for confirmed-observed/confirmed-inferred/disproved (`_conflicts` in response).
 - **findings_search** — text match on fact/evidence; confidence shortcuts `verified` / `confirmed` / exact; v1.1 param `use_fts` (FTS5 full-text, auto-fallback to LIKE). Multi-condition AND, newest first.
@@ -105,7 +107,7 @@ The update gate validates only ① + ③, and only when explicitly raising to a 
 ### G2 Situation (situation object + tree markers + render)
 
 - **situation_get** — situation object (objective/project_meta/progress/active_work/conflict_queue/candidate_directions/risks/timeline/version/frozen); default empty object (project_meta={}) when absent, no auto-insert.
-- **situation_update** — version+1 each write; timeline_event append; candidate_directions require evidence_strength ∈ {high,mid,low}; `project_meta` is slow-changing metadata (convention `{workdir, repo, engine, api, background}`), whole-object overwrite, preserved when omitted.
+- **situation_update** — version+1 each write; timeline_event append; candidate_directions require evidence_strength ∈ {high,mid,low}; `project_meta` is slow-changing metadata (convention `{workdir, repo, engine, api, background}`), whole-object overwrite, preserved when omitted. **batch2 #6**: `progress_append` / `candidate_directions_append` append to the existing list (empty list = no-op; if passed alongside the overwrite form, overwrite-then-append). Side effect: activates/switches the active project (see Write Gate ⑤).
 - **situation_report** — user-facing push text (📊/✅/🔄/⚠️/🎯/📌 rows).
 - **tree_mark / tree_unmark** — add/remove node markers (conflict/active/disproved/candidate/directive/unverified).
 - **tree_render** — indented tree view, depth-first numbering (1, 1.1, 1.1.1), findings share numbering with children; icons for markers + confidence (disproved=❌, speculative=🔒); truncates >~6000 chars with drill-down hint.
