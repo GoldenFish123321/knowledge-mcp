@@ -28,7 +28,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 
 from mcp.server.lowlevel import Server
-from mcp.types import Tool, TextContent
+from mcp.types import Tool, TextContent, PaginatedRequestParams, CallToolRequestParams, ListToolsResult, CallToolResult
 from mcp.server.stdio import stdio_server
 
 # ─── 配置 ──────────────────────────────────────────────────────────
@@ -2848,8 +2848,7 @@ def update_finding(project: str, kid: str, fact: str | None = None,
 server = Server("findings-mcp")
 
 
-@server.list_tools()
-async def list_tools() -> list[Tool]:
+async def _list_tools() -> list[Tool]:
     return [
         Tool(
             name="findings_store",
@@ -3770,8 +3769,7 @@ project_meta 从局面对象读取（无局面行时为 {}），供委派模板�
     ]
 
 
-@server.call_tool()
-async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+async def _call_tool(name: str, arguments: dict) -> list[TextContent]:
     try:
         if name == "findings_store":
             result = store_finding(
@@ -4088,6 +4086,24 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     except Exception as e:
         # catch-all：TypeError/KeyError/sqlite3.Error 等一律转 JSON error，不炸原始堆栈
         return [TextContent(type="text", text=json.dumps({"error": str(e)}, ensure_ascii=False))]
+
+
+async def _handle_list_tools(ctx, params) -> ListToolsResult:
+    """mcp 2.0 tools/list handler（替代已移除的 @server.list_tools() 装饰器）"""
+    return ListToolsResult(tools=await _list_tools())
+
+
+async def _handle_call_tool(ctx, params) -> CallToolResult:
+    """mcp 2.0 tools/call handler（替代已移除的 @server.call_tool() 装饰器）"""
+    name = params.name
+    arguments = params.arguments or {}
+    blocks = await _call_tool(name, arguments)
+    return CallToolResult(content=blocks)
+
+
+# mcp 2.0 注册（老版装饰器 API 已移除，改用 add_request_handler）
+server.add_request_handler("tools/list", PaginatedRequestParams, _handle_list_tools)
+server.add_request_handler("tools/call", CallToolRequestParams, _handle_call_tool)
 
 
 async def main():
