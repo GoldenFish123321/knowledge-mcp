@@ -980,24 +980,69 @@ def situation_get(project: str) -> dict:
     return d
 
 
+def _validate_candidate_items(items) -> None:
+    """校验候选方向列表：必须为 list，每项 dict 且含 evidence_strength ∈ {high,mid,low}。"""
+    if not isinstance(items, list):
+        raise ValueError("candidate_directions must be a list")
+    for item in items:
+        if not isinstance(item, dict) or "evidence_strength" not in item:
+            raise ValueError(
+                f"candidate_directions 每项必须含 evidence_strength ∈ {{high,mid,low}}，缺失: {item!r}")
+        if item["evidence_strength"] not in _VALID_EVIDENCE_STRENGTH:
+            raise ValueError(
+                f"invalid evidence_strength: {item['evidence_strength']!r} "
+                f"(must be high/mid/low)")
+
+
+def _normalize_progress_items(conn: sqlite3.Connection, items, project: str) -> list:
+    """校验并归一化 progress 列表：必须为 list、每项 dict；id 引用不存在的 finding
+    → 降级为纯文本摘要（去掉 id，gap-plan A1）。返回归一化后的列表。"""
+    if not isinstance(items, list):
+        raise ValueError("progress must be a list")
+    normalized = []
+    for item in items:
+        if not isinstance(item, dict):
+            raise ValueError(f"progress 每项必须为对象: {item!r}")
+        if item.get("id"):
+            exists = conn.execute(
+                "SELECT 1 FROM knowledge WHERE id = ? AND project = ?",
+                (item["id"], project),
+            ).fetchone()
+            if not exists:
+                item = {k: v for k, v in item.items() if k != "id"}
+        normalized.append(item)
+    return normalized
+
+
 def situation_update(project: str, objective: str | None = None,
                      project_meta: dict | None = None,
                      progress: list | None = None, active_work: dict | None = None,
                      candidate_directions: list | None = None, risks: list | None = None,
-                     timeline_event: dict | None = None) -> dict:
-    """更新项目局面对象（v1.1 §3.3）。
+                     timeline_event: dict | None = None,
+                     progress_append: list | None = None,
+                     candidate_directions_append: list | None = None) -> dict:
+    """更新项目局面对象（v1.1 §3.3 + batch2 #6）。
 
     - project_meta 为慢变元信息（workdir/repo/engine/api/background 等约定结构），整体覆盖存储，
       不传不覆盖（与 objective 语义一致）
     - 各列表字段 json 序列化存储；timeline_event={event, actor} 追加进 timeline（time 服务端补 _now()）
+    - progress_append / candidate_directions_append（batch2 #6）：追加到现有列表末尾，
+      空列表 = 无操作；与 progress/candidate_directions 同时传时先整体覆盖后追加
     - version 每次 +1；表无行时先 INSERT 新行（objective 默认 ''），有行时 UPDATE
     - 校验：candidate_directions 每项必须含 evidence_strength ∈ {high,mid,low}，缺失拒绝；
       progress 每项 id 若引用不存在的 finding → 降级为纯文本摘要（去掉 id，gap-plan A1）
     - P1b 审查修复：无任何有效字段（全部 None）→ 返回原状、不建行、不 bump version
-      （原实现空参数调用也 version+1，与 freeze_trigger 的写操作语义不一致）
+    - batch2 #1：本工具是父 Agent 宣布活动项目的锚点之一（写库 project 绑定校验用）
     """
+    # 空列表 append = 无操作（先归一为 None，all-None 才可能早退，不建行不 bump version）；
+    # isinstance 保护：非 list 传参走 _normalize/_validate 的 ValueError（P2-8，避免 len() 抛 TypeError）
+    if isinstance(progress_append, list) and len(progress_append) == 0:
+        progress_append = None
+    if isinstance(candidate_directions_append, list) and len(candidate_directions_append) == 0:
+        candidate_directions_append = None
     if all(v is None for v in (objective, project_meta, progress, active_work,
-                               candidate_directions, risks, timeline_event)):
+                               candidate_directions, risks, timeline_event,
+                               progress_append, candidate_directions_append)):
         return situation_get(project)
     conn = _get_conn(project)
     try:
@@ -1018,36 +1063,17 @@ def situation_update(project: str, objective: str | None = None,
         if project_meta is not None and not isinstance(project_meta, dict):
             raise ValueError(f"project_meta must be a dict, got {type(project_meta).__name__}")
 
-        # 校验：候选方向必须含 evidence_strength ∈ {high,mid,low}
+        # 校验：候选方向必须含 evidence_strength ∈ {high,mid,low}（覆盖版 + 追加版）
         if candidate_directions is not None:
-            if not isinstance(candidate_directions, list):
-                raise ValueError("candidate_directions must be a list")
-            for item in candidate_directions:
-                if not isinstance(item, dict) or "evidence_strength" not in item:
-                    raise ValueError(
-                        f"candidate_directions 每项必须含 evidence_strength ∈ {{high,mid,low}}，缺失: {item!r}")
-                if item["evidence_strength"] not in _VALID_EVIDENCE_STRENGTH:
-                    raise ValueError(
-                        f"invalid evidence_strength: {item['evidence_strength']!r} "
-                        f"(must be high/mid/low)")
+            _validate_candidate_items(candidate_directions)
+        if candidate_directions_append is not None:
+            _validate_candidate_items(candidate_directions_append)
 
-        # progress id 引用不存在 → 降级为纯文本摘要（拒绝或降级二选一，取降级）
+        # progress 归一化（覆盖版 + 追加版；id 引用不存在 → 降级纯文本）
         if progress is not None:
-            if not isinstance(progress, list):
-                raise ValueError("progress must be a list")
-            normalized = []
-            for item in progress:
-                if not isinstance(item, dict):
-                    raise ValueError(f"progress 每项必须为对象: {item!r}")
-                if item.get("id"):
-                    exists = conn.execute(
-                        "SELECT 1 FROM knowledge WHERE id = ? AND project = ?",
-                        (item["id"], project),
-                    ).fetchone()
-                    if not exists:
-                        item = {k: v for k, v in item.items() if k != "id"}
-                normalized.append(item)
-            progress = normalized
+            progress = _normalize_progress_items(conn, progress, project)
+        if progress_append is not None:
+            progress_append = _normalize_progress_items(conn, progress_append, project)
 
         # timeline_event 校验 + 追加（time 服务端补 _now()）
         new_timeline_json = None
@@ -1068,12 +1094,19 @@ def situation_update(project: str, objective: str | None = None,
             updates["objective"] = objective
         if project_meta is not None:
             updates["project_meta_json"] = json.dumps(project_meta, ensure_ascii=False)
-        if progress is not None:
-            updates["progress_json"] = json.dumps(progress, ensure_ascii=False)
+        if progress is not None or progress_append is not None:
+            base = progress if progress is not None else json.loads(cur["progress_json"] or "[]")
+            if progress_append:
+                base = list(base) + progress_append
+            updates["progress_json"] = json.dumps(base, ensure_ascii=False)
         if active_work is not None:
             updates["active_work_json"] = json.dumps(active_work, ensure_ascii=False)
-        if candidate_directions is not None:
-            updates["candidate_directions_json"] = json.dumps(candidate_directions, ensure_ascii=False)
+        if candidate_directions is not None or candidate_directions_append is not None:
+            base = candidate_directions if candidate_directions is not None \
+                else json.loads(cur["candidate_directions_json"] or "[]")
+            if candidate_directions_append:
+                base = list(base) + candidate_directions_append
+            updates["candidate_directions_json"] = json.dumps(base, ensure_ascii=False)
         if risks is not None:
             updates["risks_json"] = json.dumps(risks, ensure_ascii=False)
         if new_timeline_json is not None:
@@ -1088,6 +1121,8 @@ def situation_update(project: str, objective: str | None = None,
                 f"UPDATE situations SET {sets} WHERE project = ?",
                 (*updates.values(), project),
             )
+            # batch2 #1：局面更新 = 父 Agent 宣布活动项目（子 Agent 写库 project 绑定锚点）
+            _set_active_project(project)
             conn.commit()
     finally:
         conn.close()
@@ -1438,6 +1473,10 @@ def directive_create(project: str, text: str, anchor: str | None = None,
             raise RuntimeError(
                 f"directive id 分配并发冲突 10 次仍失败（project={project}）"
             )
+        # batch2 #1：指令创建 = 父 Agent 宣布活动项目（写库 project 绑定锚点）。
+        # 必须在撞号重试循环外——循环内任何异常（含全局库锁）都会被 except 捕获重试，
+        # 导致指令重复插入（P1-3 修复）
+        _set_active_project(project)
     finally:
         conn.close()
     return {
@@ -2062,6 +2101,8 @@ def project_list() -> list[dict]:
     for db_file in sorted(DB_DIR.glob("*.db")):
         if db_file.name.endswith(("-wal.db", "-shm.db")):
             continue
+        if db_file.name == _GLOBAL_DB_NAME:
+            continue  # 全局状态库（app_state）不是项目
         project = db_file.name[:-3]
         try:
             conn = sqlite3.connect(str(db_file))
@@ -2292,6 +2333,85 @@ def _parse_source_role(source: str | None) -> str | None:
     return m.group(1).lower() if m else None
 
 
+# ---------------------------------------------------------------------------
+# project 绑定（v1.1-batch2 #1）：子 Agent 落库 project 必须等于活动项目
+# ---------------------------------------------------------------------------
+
+_GLOBAL_DB_NAME = "_app_state.db"
+
+
+def _get_global_conn() -> sqlite3.Connection:
+    """全局状态连接（app_state：活动项目等跨项目元数据）。
+
+    active_project 是全局状态——项目库是每项目一个独立 db 文件，放进任何项目库
+    都会导致其他项目库读不到。独立全局库 + WAL/busy_timeout 与项目库保持一致。
+    """
+    conn = sqlite3.connect(str(DB_DIR / _GLOBAL_DB_NAME))
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("CREATE TABLE IF NOT EXISTS app_state ("
+                 "key   TEXT PRIMARY KEY,"
+                 "value TEXT NOT NULL"
+                 ")")
+    return conn
+
+
+def _set_active_project(project: str) -> None:
+    """记录/切换活动项目（app_state.active_project）。
+
+    由父 Agent 的 situation_update / directive_create 隐式触发——这两个工具是
+    父 Agent 宣布\"当前在哪个项目干活\"的自然锚点（建议 #1 方案 b 的服务端实现）。
+    """
+    conn = _get_global_conn()
+    try:
+        conn.execute(
+            "INSERT INTO app_state (key, value) VALUES ('active_project', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (project,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _get_active_project() -> str | None:
+    """读取当前活动项目；从未激活返回 None。"""
+    conn = _get_global_conn()
+    try:
+        row = conn.execute(
+            "SELECT value FROM app_state WHERE key = 'active_project'"
+        ).fetchone()
+        return row["value"] if row else None
+    finally:
+        conn.close()
+
+
+def _check_project_binding(project: str, source: str | None) -> None:
+    """⑤ project 绑定校验（v1.1-batch2 #1，write_gate 第五层）。
+
+    规则（fail-open 兼容旧流程）：
+      - 活动项目未激活（app_state.active_project 为空）→ 放行
+      - role=parent 或 role 无法解析 → 豁免（父 Agent 有全局视角，可做迁移/清理）
+      - 明确子 Agent role（discovery/detector/judge/analyst/leaf）且
+        project ≠ 活动项目 → write_gate_violation
+
+    失败 raise ValueError（write_gate_violation 格式）。
+    """
+    active = _get_active_project()
+    if active is None:
+        return
+    role = _parse_source_role(source)
+    if role is None or role == "parent":
+        return
+    if role in _SUBAGENT_ROLES and project != active:
+        raise ValueError(
+            f"write_gate_violation: project={project!r} 与活动项目 {active!r} 不一致 | "
+            "suggestion: 使用父 Agent 最近 situation_update/directive_create 激活的"
+            "项目名，或请父 Agent 先 situation_update 切换活动项目"
+        )
+
+
 def _check_role_authority(source: str | None, confidence: str) -> None:
     """① 角色权责（v1.1 §1.3 ① / v2 §5.1）：
     - 子 Agent（discovery/detector/judge/analyst/leaf）标 confirmed-inferred / speculative → 拒绝
@@ -2338,21 +2458,27 @@ def _check_cross_validation(evidence: str) -> None:
         )
 
 
-def _validate_write_gate(conn: sqlite3.Connection, confidence: str, type_: str,
+def _validate_write_gate(conn: sqlite3.Connection, project: str,
+                         confidence: str, type_: str,
                          based_on: str | None, source: str | None, fact: str,
                          task_budget: dict | None = None,
                          evidence: str = "") -> None:
-    """写库 gate：四层结构校验（v1.1 §1.3 / gap-plan D2）。
+    """写库 gate：五层结构校验（v1.1 §1.3 / gap-plan D2 + batch2 #1）。
 
     ① 角色权责：子 Agent 禁标 confirmed-inferred/speculative；role 缺失默认拒绝
     ② type 校验：claim 必须 based_on ≥1 条 observation（ID 存在且 type=observation）；
        hypothesis 必须含 'test_plan:'；task 必须带完整 budget 三字段；type 必须是合法枚举
     ③ confirmed-inferred：evidence 必须含两个不同 agent-id（交叉验证标记）
+    ⑤ project 绑定：子 Agent 落库 project 必须等于活动项目（situation_update/
+       directive_create 激活；未激活 fail-open；parent/role 缺失豁免）
     ④ 只做结构校验，不做语义校验（见上方职责边界注释）
 
     通过返回 None；失败 raise ValueError，消息格式：
     "write_gate_violation: <reason> | suggestion: <suggestion>"
     """
+    # ⑤ project 绑定
+    _check_project_binding(project, source)
+
     # ① 角色权责
     _check_role_authority(source, confidence)
 
@@ -2433,10 +2559,15 @@ def store_finding(project: str, fact: str, confidence: str, source: str,
     # json.dumps 预序列化（开连接前，P0 审查修复）：tags 不可序列化抛 TypeError 时不占连接
     tags_json = json.dumps(tags or [], ensure_ascii=False)
 
+    # batch2 #1 前置拒绝：绑定校验放在 _get_conn 之前——拒绝路径不创建 {project}.db，
+    # 避免"乱写 project 被拒后仍残留空库文件"（P1-2 修复；_validate_write_gate 内保留
+    # ⑤ 作为 gate 完整性防御，双保险）
+    _check_project_binding(project, source)
+
     conn = _get_conn(project)
     try:
         # ── 写库 gate（INSERT 前，v1.1 §1.3）──
-        _validate_write_gate(conn, confidence, type_, based_on, source, fact,
+        _validate_write_gate(conn, project, confidence, type_, based_on, source, fact,
                              task_budget=task_budget, evidence=evidence)
 
         kid = str(uuid.uuid4())
@@ -2624,6 +2755,11 @@ def update_finding(project: str, kid: str, fact: str | None = None,
     # P1b 审查修复：tags 预序列化移到 _get_conn 之前（与 store_finding 一致）——
     # 含不可序列化对象时 json.dumps 抛 TypeError 不占用连接（原实现序列化在连接内执行）
     tags_json = json.dumps(tags, ensure_ascii=False) if tags is not None else None
+
+    # batch2 #1：绑定校验同样前置——子 Agent 不得 update 非活动项目（README 声称
+    # findings_update 走五层 gate，此处补上；source=None → role None → 豁免，不误伤
+    # 父 Agent 与无 role 的既有脚本调用）
+    _check_project_binding(project, source)
 
     conn = _get_conn(project)
 
@@ -3147,12 +3283,15 @@ risks, user_directives, timeline, version, frozen, frozen_at, updated_at}
         ),
         Tool(
             name="situation_update",
-            description="""更新项目局面对象（状态层，v1.1 §3.3）。
+            description="""更新项目局面对象（状态层，v1.1 §3.3 + batch2 #6）。
 
 - project_meta 为慢变元信息（约定结构 {workdir, repo, engine, api, background}），整体覆盖，不传不覆盖
 - 各列表字段 json 序列化存储；timeline_event={event, actor} 追加进 timeline（time 服务端补）
+- progress_append / candidate_directions_append 为追加模式：追加到现有列表末尾，空列表 = 无操作；
+  与 progress/candidate_directions 同时传时先整体覆盖后追加
 - version 每次 +1；无局面记录时自动建行（objective 默认 ''）
 - 校验：candidate_directions 每项必须含 evidence_strength ∈ {high,mid,low}，缺失拒绝
+- 副作用：本工具会激活/切换活动项目（子 Agent 写库 project 绑定校验的锚点）
 
 参数:
   project             — 项目名
@@ -3162,7 +3301,9 @@ risks, user_directives, timeline, version, frozen, frozen_at, updated_at}
   active_work         — 活跃工作对象 {agent, task, last_heartbeat}
   candidate_directions— 候选方向列表 [{direction, evidence_strength}]（evidence_strength 必填）
   risks               — 风险列表
-  timeline_event      — 追加时间线事件 {event, actor}""",
+  timeline_event      — 追加时间线事件 {event, actor}
+  progress_append     — 追加的进度摘要列表（追加到现有 progress 末尾，可选）
+  candidate_directions_append — 追加的候选方向列表（追加到现有末尾，evidence_strength 必填，可选）""",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -3174,6 +3315,8 @@ risks, user_directives, timeline, version, frozen, frozen_at, updated_at}
                     "candidate_directions": {"type": "array", "items": {"type": "object"}, "description": "候选方向 [{direction, evidence_strength}]"},
                     "risks": {"type": "array", "items": {"type": "string"}, "description": "风险列表"},
                     "timeline_event": {"type": "object", "description": "时间线事件 {event, actor}"},
+                    "progress_append": {"type": "array", "items": {"type": "object"}, "description": "追加的进度摘要列表"},
+                    "candidate_directions_append": {"type": "array", "items": {"type": "object"}, "description": "追加的候选方向列表（evidence_strength 必填）"},
                 },
                 "required": ["project"],
             },
@@ -3779,6 +3922,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 candidate_directions=arguments.get("candidate_directions"),
                 risks=arguments.get("risks"),
                 timeline_event=arguments.get("timeline_event"),
+                progress_append=arguments.get("progress_append"),
+                candidate_directions_append=arguments.get("candidate_directions_append"),
             )
             return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
 
