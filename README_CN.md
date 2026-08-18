@@ -342,7 +342,7 @@ artifact://tool_output/<project>/<sha1>.txt
 ### 直接运行
 
 ```bash
-pip install "mcp>=1.20,<2.0"     # server.py 使用 mcp 1.x API
+pip install -r requirements.txt   # requirements 已钉 mcp>=2.0,<3（server.py 使用 mcp 2.0 API）
 python server.py
 ```
 

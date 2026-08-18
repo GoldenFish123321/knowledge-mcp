@@ -165,7 +165,7 @@ Per-project tables: `knowledge` (findings, incl. type/evidence_uri), `tree_nodes
 ### Direct
 
 ```bash
-pip install "mcp>=1.20,<2.0"     # server.py uses mcp 1.x API
+pip install -r requirements.txt   # requirements 已钉 mcp>=2.0,<3（server.py 用 mcp 2.0 API）
 python server.py
 ```
 
