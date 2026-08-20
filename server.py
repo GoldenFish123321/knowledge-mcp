@@ -683,12 +683,12 @@ def tree_delete(project: str, node_id: str) -> dict:
 # ─── 监督层（v1.1 §3.6 E 组）：audit 审计 + freeze 冻结状态 ──────────
 # 规则编号（v1.1 §1.2 ⑥）：
 #   R1 委派前无 search | R2 同假设失败≥2 | R3 汇报无置信度 | R4 委派 context 无验证 | R5 冻结触发
-# 自动冻结条件（v1.1 §3.6）：违规计数≥3 OR 未解决待办≥3 OR 存在 repeat_count≥2 的指令；
+# 自动冻结条件（v1.1 §3.6）：违规计数≥3 OR 未解决待办≥5 OR 存在 repeat_count≥2 的指令；
 # 显式冻结由 freeze_trigger 写 situations.frozen（非空）触发。MCP 侧只做状态存储与查询原语，
 # "冻结拦截" 属平台层 hook（gap-plan §6.3：MCP 边界 = 状态存储 + 查询）。
 
 FREEZE_VIOLATION_THRESHOLD = 3      # 违规计数阈值（audit_log count）
-FREEZE_UNRESOLVED_THRESHOLD = 3     # 未解决待办阈值（directives status != 'resolved'）
+FREEZE_UNRESOLVED_THRESHOLD = 5     # 未解决待办阈值（directives status != 'resolved'；2026-08-19 3→5，与 ctf-preset freeze-gate 对齐，缓解扇出工作流频繁误冻）
 FREEZE_REPEAT_THRESHOLD = 2         # 重复指令阈值（directives repeat_count）
 _EXPLICIT_FREEZE_PREFIX = "显式冻结"  # reason 中显式冻结项前缀，与自动触发项区分
 
